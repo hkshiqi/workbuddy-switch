@@ -1,5 +1,5 @@
 import type {
-  AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
+  AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinHealth, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   DisplayField,
   GithubConfig, RateLimitHookStatus, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
@@ -429,11 +429,26 @@ function buildStatistics(): CreditStatistics {
 function checkinConfig(): CheckinConfig {
   return {
     enabled: true,
+    // 演示截图里开关是用户自己开的：不显示「自动启用」提示。
+    enabled_source: "user",
     excluded_account_ids: [],
     checkin_start: "",
     checkin_end: "",
     keepalive_days: 7,
     lazy_refresh_hours: 12,
+  };
+}
+
+/** 演示心跳：刚刚成功跑过一轮，设置页的「上一轮」行不会高亮成超时。 */
+function checkinHealth(): CheckinHealth {
+  return {
+    ts: Date.now() - 3 * 60_000,
+    last_status: "ok",
+    had_errors: false,
+    panicked: false,
+    consecutive_panics: 0,
+    last_error: null,
+    file_exists: true,
   };
 }
 
@@ -964,6 +979,7 @@ export function screenshotDemoResponse(command: string, args?: Record<string, un
     case "get_token_statistics": return demoTokenStatistics(typeof args?.days === "number" ? args.days : undefined);
     case "get_auto_checkin_config": return checkinConfig();
     case "get_checkin_logs": return { logs: checkinLogs() };
+    case "get_checkin_health": return checkinHealth();
     case "get_travel_status": return travelStatus(String(args?.accountId ?? ""));
     case "get_rate_limits": return rateLimits();
     case "get_rate_limit_hook_status": return rateLimitHookStatus();

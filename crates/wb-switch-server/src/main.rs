@@ -22,15 +22,18 @@ fn default_port() -> u16 {
 /// 后台任务：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
 /// 签到时间段时固定 30 分钟）；自动轮换按配置间隔执行；
 /// 限额 hook 信号每秒轮询一次、启动时后台默认接入。
+///
+/// 签到走 `run_checkin_round`：它在独立任务里跑一轮，任务 panic 只会变成心跳里的
+/// `panic` 状态并继续下一轮，不会让这条 `loop` 静默停摆（见 core 的同名函数）。
 fn spawn_background_loops() {
     tokio::spawn(async move {
         if let Err(error) = config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
         }
-        let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::StartupVerify).await;
+        let _ = checkin::run_checkin_round(checkin::CheckinCycleMode::StartupVerify).await;
         loop {
             tokio::time::sleep(checkin::next_cycle_delay()).await;
-            let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
+            let _ = checkin::run_checkin_round(checkin::CheckinCycleMode::PeriodicRecovery).await;
         }
     });
 

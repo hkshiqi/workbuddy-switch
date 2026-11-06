@@ -202,6 +202,7 @@ pub fn router() -> Router {
             get(api_checkin_config).post(api_save_checkin_config),
         )
         .route("/api/checkin/logs", get(api_checkin_logs))
+        .route("/api/checkin/health", get(api_checkin_health))
         .route("/api/notifications", get(api_notifications))
         .route("/api/notifications/record", post(api_record_notification))
         .route("/api/notifications/clear", post(api_clear_notifications))
@@ -1508,8 +1509,21 @@ async fn api_checkin_config() -> Response {
 
 async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
     let submitted = body.get("config").unwrap_or(&body);
+    // 与自动旅行保存同语义：enabled 由关转开时立即跑一轮，避免「开了开关却要等 30 分钟」。
+    // 只在 false→true 触发，改时间段 / 排除名单不会白白发请求。
+    let before = config::load_checkin_config();
     match config::save_checkin_config(submitted) {
-        Ok(()) => json_ok(config::load_checkin_config()),
+        Ok(()) => {
+            let saved = config::load_checkin_config();
+            let was_enabled = before.get("enabled").and_then(Value::as_bool) == Some(true);
+            if !was_enabled && saved.get("enabled").and_then(Value::as_bool) == Some(true) {
+                tokio::spawn(async {
+                    let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery)
+                        .await;
+                });
+            }
+            json_ok(saved)
+        }
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }
 }
@@ -1517,6 +1531,13 @@ async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
 /// GET /api/checkin/logs —— 签到日志（每行带 `variant`，便于前端按档位过滤）。
 async fn api_checkin_logs() -> Response {
     json_ok(json!({ "logs": checkin::load_checkin_logs_with_variant() }))
+}
+
+/// GET /api/checkin/health —— 自动签到循环心跳（设置页「上一轮」展示用）。
+///
+/// 只读：文件缺失或损坏时 core 返回安全默认值（`ts: 0` / `last_status: "unknown"`）。
+async fn api_checkin_health() -> Response {
+    json_ok(config::load_checkin_health())
 }
 
 async fn api_travel_status() -> Response {

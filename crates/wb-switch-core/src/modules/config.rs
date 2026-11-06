@@ -367,17 +367,21 @@ fn merge_checkin_config(input: &Value) -> Value {
 
 /// 读取签到配置（缺失/损坏时合并默认值）。
 ///
-/// 配置只在用户显式保存时落盘，「无配置文件」无法区分新老安装：按使用痕迹（配置文件
-/// 或签到日志）判定已有用户，没有显式值时沿用历史默认（开启）；全新安装默认关闭。
+/// 配置只在用户显式保存时落盘，「无配置文件」无法区分新老安装：判据是**配置文件
+/// 是否存在**，只有配置文件存在才算已有用户（没有显式值时沿用历史默认开启）；
+/// 全新安装默认关闭。
+///
+/// 判据不含签到日志：手动签到也会写日志，把它当「使用痕迹」会让一次手动签到
+/// 静默把自动签到打开（见 `docs/CHECKIN-BEHAVIOR-CHANGE.md`）。
 pub fn load_checkin_config() -> Value {
-    load_checkin_config_at(&checkin_config_file(), &checkin_logs_file())
+    load_checkin_config_at(&checkin_config_file())
 }
 
-fn load_checkin_config_at(config_path: &Path, logs_path: &Path) -> Value {
+fn load_checkin_config_at(config_path: &Path) -> Value {
     let input = std::fs::read_to_string(config_path)
         .ok()
         .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-    resolve_checkin_config(input.as_ref(), config_path.exists() || logs_path.exists())
+    resolve_checkin_config(input.as_ref(), config_path.exists())
 }
 
 fn resolve_checkin_config(input: Option<&Value>, existing_install: bool) -> Value {
@@ -389,15 +393,45 @@ fn resolve_checkin_config(input: Option<&Value>, existing_install: bool) -> Valu
     if let Some(input) = input {
         apply_checkin_config(&mut merged, input);
     }
+    // 派生字段：只出现在读取结果里，让前端能区分「用户亲手开」与「默认回落」。
+    // `merge_checkin_config` 从 `default_checkin_config()` 起合并，天然不含该键，
+    // 因此它绝不会被写进 `auto_checkin_config.json`。
+    merged["enabled_source"] = json!(checkin_enabled_source(input, existing_install));
     merged
+}
+
+/// `enabled` 的来源（三态，见 [`resolve_checkin_config`]）。
+///
+/// - `user`：配置里带显式 `enabled` 布尔值（用户亲手设过）；
+/// - `legacy_config`：配置文件存在但没有可用的 `enabled`（旧版本写的配置 / 内容损坏）；
+/// - `default`：其余（全新安装；仅有签到日志这类痕迹不再算已有安装）。
+fn checkin_enabled_source(input: Option<&Value>, existing_install: bool) -> &'static str {
+    let explicit = input
+        .and_then(Value::as_object)
+        .and_then(|map| map.get("enabled"))
+        .and_then(Value::as_bool)
+        .is_some();
+    if explicit {
+        "user"
+    } else if existing_install {
+        "legacy_config"
+    } else {
+        "default"
+    }
 }
 
 /// 保存签到配置（只保留已知字段）。
 pub fn save_checkin_config(cfg: &Value) -> std::io::Result<()> {
+    save_checkin_config_at(&checkin_config_file(), cfg)
+}
+
+fn save_checkin_config_at(path: &Path, cfg: &Value) -> std::io::Result<()> {
     let merged = merge_checkin_config(cfg);
-    std::fs::create_dir_all(store_dir())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let content = serde_json::to_string_pretty(&merged).unwrap_or_default();
-    atomic_write(&checkin_config_file(), &content)
+    atomic_write(path, &content)
 }
 
 /// 读取签到日志。
@@ -551,6 +585,149 @@ pub fn add_checkin_log(entry: &Value) {
     let mut logs = load_checkin_logs();
     logs.push(entry.clone());
     let _ = save_checkin_logs_unlocked(&logs);
+}
+
+// ---------------------------------------------------------------------------
+// 自动签到心跳（可观测性：设置页展示「上一轮」）
+// ---------------------------------------------------------------------------
+
+pub fn checkin_heartbeat_file() -> PathBuf {
+    store_dir().join("checkin_heartbeat.json")
+}
+
+/// 心跳的安全默认值：从未跑过 / 文件损坏时返回它（任何字段都不得让调用方 panic）。
+fn checkin_heartbeat_default() -> Value {
+    json!({
+        "ts": 0,
+        "last_status": "unknown",
+        "had_errors": false,
+        "panicked": false,
+        "consecutive_panics": 0,
+        "last_error": null,
+    })
+}
+
+/// 心跳里保存的失败原因上限（panic 文本可能带很长 backtrace 描述）。
+const HEARTBEAT_ERROR_MAX_CHARS: usize = 300;
+
+/// 读取心跳文件（按字段白名单逐项校验，缺失/类型不符的字段回落默认值）。
+fn read_checkin_heartbeat_at(path: &Path) -> Value {
+    let mut heartbeat = checkin_heartbeat_default();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return heartbeat;
+    };
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&text) else {
+        return heartbeat;
+    };
+    if let Some(ts) = map.get("ts").and_then(Value::as_i64) {
+        heartbeat["ts"] = json!(ts);
+    }
+    if let Some(status) = map.get("last_status").and_then(Value::as_str) {
+        heartbeat["last_status"] = json!(status);
+    }
+    if let Some(had_errors) = map.get("had_errors").and_then(Value::as_bool) {
+        heartbeat["had_errors"] = json!(had_errors);
+    }
+    if let Some(panicked) = map.get("panicked").and_then(Value::as_bool) {
+        heartbeat["panicked"] = json!(panicked);
+    }
+    if let Some(count) = map.get("consecutive_panics").and_then(Value::as_i64) {
+        heartbeat["consecutive_panics"] = json!(count.max(0));
+    }
+    if let Some(error) = map
+        .get("last_error")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        heartbeat["last_error"] = json!(error);
+    }
+    heartbeat
+}
+
+fn record_checkin_heartbeat_at(
+    path: &Path,
+    at_ms: i64,
+    status: &str,
+    had_errors: bool,
+    panicked: bool,
+    last_error: Option<&str>,
+) -> Value {
+    let previous = read_checkin_heartbeat_at(path);
+    let previous_panics = previous
+        .get("consecutive_panics")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let consecutive_panics = if panicked {
+        previous_panics.saturating_add(1)
+    } else {
+        0
+    };
+    let mut heartbeat = json!({
+        "ts": at_ms,
+        "last_status": status,
+        "had_errors": had_errors,
+        "panicked": panicked,
+        "consecutive_panics": consecutive_panics,
+        "last_error": null,
+    });
+    if let Some(error) = last_error {
+        // 截断下沉到唯一的写盘入口：`record_checkin_failure_heartbeat` 在外层也截一次，
+        // 但任何直接调用本函数的新代码都不该能把心跳文件撑大。
+        let truncated: String = error.chars().take(HEARTBEAT_ERROR_MAX_CHARS).collect();
+        heartbeat["last_error"] = json!(truncated);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let content = serde_json::to_string_pretty(&heartbeat).unwrap_or_default();
+    // 心跳只承载可观测性：写不进去也不能影响调度，因此忽略写盘错误。
+    let _ = atomic_write(path, &content);
+    heartbeat
+}
+
+/// 记录一轮自动签到的心跳（`~/.wb-switch/checkin_heartbeat.json`）。
+///
+/// 每轮结束（含 `disabled` / `no_accounts` / `before_checkin_time` 各早退路径）
+/// 与宿主侧的 panic 守护都会写一次；`panicked = true` 时累加
+/// `consecutive_panics`，正常轮次清零。返回写入的内容，便于测试与调用方复用。
+pub fn record_checkin_heartbeat(status: &str, had_errors: bool, panicked: bool) -> Value {
+    record_checkin_heartbeat_at(
+        &checkin_heartbeat_file(),
+        now_ms(),
+        status,
+        had_errors,
+        panicked,
+        None,
+    )
+}
+
+/// 记录一轮被守护捕获的失败心跳，并把 panic 原因一并落盘。
+///
+/// 原因来自 `JoinError::to_string()`：不落盘的话宿主会 `let _ =` 丢掉返回值，
+/// 用户只能看到「异常」而无法反馈具体原因。
+pub fn record_checkin_failure_heartbeat(status: &str, panicked: bool, last_error: &str) -> Value {
+    let truncated: String = last_error.chars().take(HEARTBEAT_ERROR_MAX_CHARS).collect();
+    record_checkin_heartbeat_at(
+        &checkin_heartbeat_file(),
+        now_ms(),
+        status,
+        true,
+        panicked,
+        Some(&truncated),
+    )
+}
+
+fn load_checkin_health_at(path: &Path) -> Value {
+    let mut health = read_checkin_heartbeat_at(path);
+    health["file_exists"] = json!(path.exists());
+    health
+}
+
+/// 读取自动签到健康度（设置页 / API 展示用）。
+///
+/// 文件缺失或损坏时返回安全默认值（`ts: 0` 等），绝不 panic。
+pub fn load_checkin_health() -> Value {
+    load_checkin_health_at(&checkin_heartbeat_file())
 }
 
 // ---------------------------------------------------------------------------
@@ -1240,8 +1417,15 @@ mod tests {
             let resolved = resolve_checkin_config(Some(&input), existing_install);
             assert_eq!(resolved["enabled"], json!(existing_install));
             assert_eq!(resolved["excluded_account_ids"], json!(["account-a"]));
-            // 保存已解析配置后，新老安装均保留开关状态和账号排除列表。
-            assert_eq!(merge_checkin_config(&resolved), resolved);
+            // 保存已解析配置后，新老安装均保留开关状态和账号排除列表；
+            // `enabled_source` 是不落盘的派生字段，合并结果里必须没有它。
+            let merged = merge_checkin_config(&resolved);
+            assert_eq!(merged.get("enabled"), resolved.get("enabled"));
+            assert_eq!(
+                merged.get("excluded_account_ids"),
+                resolved.get("excluded_account_ids")
+            );
+            assert!(merged.get("enabled_source").is_none());
         }
     }
 
@@ -1250,10 +1434,15 @@ mod tests {
         // 全新安装（无配置文件、无签到日志）：默认关闭。
         let fresh = resolve_checkin_config(None, false);
         assert_eq!(fresh.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(fresh.get("enabled_source"), Some(&json!("default")));
 
-        // 已有用户（签到日志即使用痕迹）：沿用历史默认开启，升级不改状态。
+        // 已有用户（配置文件即使用痕迹）：沿用历史默认开启，升级不改状态。
         let existing = resolve_checkin_config(None, true);
         assert_eq!(existing.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            existing.get("enabled_source"),
+            Some(&json!("legacy_config"))
+        );
         // 痕迹只影响 enabled，其余字段仍与默认一致。
         assert_eq!(
             existing.get("lazy_refresh_hours").and_then(Value::as_i64),
@@ -1261,58 +1450,325 @@ mod tests {
         );
         assert_eq!(existing.get("checkin_start"), Some(&json!("")));
 
-        // 显式值优先于痕迹。
+        // 显式值优先于痕迹，并标记来源为 user。
         for existing_install in [false, true] {
             let off = resolve_checkin_config(Some(&json!({"enabled": false})), existing_install);
             assert_eq!(off.get("enabled").and_then(Value::as_bool), Some(false));
+            assert_eq!(off.get("enabled_source"), Some(&json!("user")));
             let on = resolve_checkin_config(Some(&json!({"enabled": true})), existing_install);
             assert_eq!(on.get("enabled").and_then(Value::as_bool), Some(true));
+            assert_eq!(on.get("enabled_source"), Some(&json!("user")));
         }
+
+        // 非布尔 enabled 不算用户设置：回落痕迹判定。
+        let bogus = resolve_checkin_config(Some(&json!({"enabled": "yes"})), true);
+        assert_eq!(bogus.get("enabled_source"), Some(&json!("legacy_config")));
     }
 
+    /// 配置文件存在（无论内容是否可解析）都算已有用户；仅有日志不算。
     #[test]
-    fn load_checkin_config_uses_usage_trace_files() {
+    fn load_checkin_config_only_treats_config_file_as_usage_trace() {
         let dir =
             std::env::temp_dir().join(format!("wb-switch-checkin-config-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("auto_checkin_config.json");
+        // 日志文件仍写进同一目录：判据不得再读它。
         let logs_path = dir.join("auto_checkin_logs.json");
 
         // 两者皆无 → 全新安装，默认关闭。
+        let fresh = load_checkin_config_at(&config_path);
+        assert_eq!(fresh.get("enabled").and_then(Value::as_bool), Some(false));
+        assert_eq!(fresh.get("enabled_source"), Some(&json!("default")));
+
+        // 只有签到日志（手动签到留下的痕迹）→ 仍是全新安装，保持关闭。
+        // 这是行为变更：旧判据（config || logs）会在这里返回 true。
+        std::fs::write(&logs_path, "[]").unwrap();
+        let logs_only = load_checkin_config_at(&config_path);
         assert_eq!(
-            load_checkin_config_at(&config_path, &logs_path)
-                .get("enabled")
-                .and_then(Value::as_bool),
+            logs_only.get("enabled").and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(logs_only.get("enabled_source"), Some(&json!("default")));
 
-        // 只有签到日志（使用痕迹）→ 已有用户，保持开启。
-        std::fs::write(&logs_path, "[]").unwrap();
+        // 显式保存的 false / true 覆盖痕迹，来源标记为 user。
+        std::fs::write(&config_path, "{\"enabled\": false}").unwrap();
+        let explicit_off = load_checkin_config_at(&config_path);
         assert_eq!(
-            load_checkin_config_at(&config_path, &logs_path)
-                .get("enabled")
-                .and_then(Value::as_bool),
+            explicit_off.get("enabled").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(explicit_off.get("enabled_source"), Some(&json!("user")));
+
+        // 配置文件存在但没有 enabled 字段 → 旧版配置写的，沿用历史默认开启。
+        std::fs::write(&config_path, "{\"checkin_start\": \"09:00\"}").unwrap();
+        let legacy = load_checkin_config_at(&config_path);
+        assert_eq!(legacy.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(legacy.get("enabled_source"), Some(&json!("legacy_config")));
+
+        // 只有日志 + 显式 enabled:true → 仍是用户亲手开的。
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::write(&config_path, "{\"enabled\": true}").unwrap();
+        let explicit_on = load_checkin_config_at(&config_path);
+        assert_eq!(
+            explicit_on.get("enabled").and_then(Value::as_bool),
             Some(true)
         );
-
-        // 显式保存的 false 覆盖痕迹。
-        std::fs::write(&config_path, "{\"enabled\": false}").unwrap();
-        assert_eq!(
-            load_checkin_config_at(&config_path, &logs_path)
-                .get("enabled")
-                .and_then(Value::as_bool),
-            Some(false)
-        );
+        assert_eq!(explicit_on.get("enabled_source"), Some(&json!("user")));
 
         // 配置文件损坏但存在 → 仍按已有用户处理（不因损坏而改状态）。
         std::fs::remove_file(&logs_path).unwrap();
         std::fs::write(&config_path, "not-json").unwrap();
+        let corrupt = load_checkin_config_at(&config_path);
+        assert_eq!(corrupt.get("enabled").and_then(Value::as_bool), Some(true));
+        assert_eq!(corrupt.get("enabled_source"), Some(&json!("legacy_config")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `enabled_source` 是读取期派生字段：保存产物里绝不能出现它。
+    #[test]
+    fn save_checkin_config_never_persists_enabled_source() {
+        assert!(default_checkin_config().get("enabled_source").is_none());
+        assert!(legacy_default_checkin_config()
+            .get("enabled_source")
+            .is_none());
+
+        for input in [
+            json!({"enabled": true}),
+            json!({"enabled_source": "user", "enabled": true}),
+            json!({"excluded_account_ids": ["account-a"], "enabled_source": "legacy_config"}),
+        ] {
+            let merged = merge_checkin_config(&input);
+            assert!(
+                merged.get("enabled_source").is_none(),
+                "保存产物不得含派生字段: {merged}"
+            );
+            let serialized = serde_json::to_string(&merged).unwrap();
+            assert!(!serialized.contains("enabled_source"));
+        }
+
+        // 读取结果 → 再合并（即 save_checkin_config 的产物）同样不含该键。
+        let resolved = resolve_checkin_config(Some(&json!({"enabled": true})), false);
+        assert_eq!(resolved.get("enabled_source"), Some(&json!("user")));
+        assert!(merge_checkin_config(&resolved)
+            .get("enabled_source")
+            .is_none());
+
+        // 真正的落盘产物：写到临时文件后逐字检查，确认派生字段不会被持久化。
+        let dir =
+            std::env::temp_dir().join(format!("wb-switch-checkin-save-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("auto_checkin_config.json");
+        save_checkin_config_at(&path, &resolved).expect("保存签到配置必须成功");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("enabled_source"), "落盘内容不得含派生字段");
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        assert!(parsed.get("enabled_source").is_none());
+        assert_eq!(parsed.get("enabled"), Some(&json!(true)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 日志治理：重复 `already` 按 (账号, 本地日期) 去重保最新，且总量不超过 500 条。
+    #[test]
+    fn checkin_logs_dedup_already_rows_and_cap_at_max_records() {
+        let day_ms = local_timestamp_ms(2026, 9, 21, 12);
+        let ts_at = |offset_ms: i64| day_ms + offset_ms;
+
+        // 同一账号同一天的 3 条 already：只保留最新一条。
+        let repeated = vec![
+            json!({"ts": ts_at(0), "accountId": "a", "email": "a", "result": "already"}),
+            json!({"ts": ts_at(60_000), "accountId": "a", "email": "a", "result": "already"}),
+            json!({"ts": ts_at(120_000), "accountId": "a", "email": "a", "result": "already"}),
+        ];
+        let normalized = normalize_checkin_logs(&repeated, ts_at(180_000));
+        assert_eq!(normalized.len(), 1);
         assert_eq!(
-            load_checkin_config_at(&config_path, &logs_path)
-                .get("enabled")
-                .and_then(Value::as_bool),
-            Some(true)
+            normalized[0].get("ts").and_then(Value::as_i64),
+            Some(ts_at(120_000))
         );
+
+        // 不同账号 / 不同日期各自保留一条。
+        let mixed = vec![
+            json!({"ts": ts_at(0), "accountId": "a", "email": "a", "result": "already"}),
+            json!({"ts": ts_at(0), "accountId": "b", "email": "b", "result": "already"}),
+            json!({"ts": ts_at(0), "accountId": "a", "email": "a", "result": "success"}),
+        ];
+        assert_eq!(normalize_checkin_logs(&mixed, ts_at(60_000)).len(), 3);
+
+        // 超量：保留最近 CHECKIN_LOG_MAX_RECORDS 条（最老的被丢弃）。
+        let many: Vec<Value> = (0..CHECKIN_LOG_MAX_RECORDS + 40)
+            .map(|index| {
+                json!({
+                    "ts": ts_at(index as i64 * 1000),
+                    "accountId": format!("acct-{index}"),
+                    "email": format!("acct-{index}"),
+                    "result": "success",
+                })
+            })
+            .collect();
+        let capped = normalize_checkin_logs(&many, ts_at(10 * 60 * 60 * 1000));
+        assert_eq!(capped.len(), CHECKIN_LOG_MAX_RECORDS);
+        assert_eq!(capped[0].get("accountId"), Some(&json!("acct-40")));
+        assert_eq!(
+            capped[capped.len() - 1].get("accountId"),
+            Some(&json!(format!("acct-{}", CHECKIN_LOG_MAX_RECORDS + 39)))
+        );
+
+        // 超过 30 天的记录整条丢弃（不会占满 500 条配额）。
+        let stale = json!({
+            "ts": ts_at(-(CHECKIN_LOG_KEEP_DAYS + 1) * 24 * 3600 * 1000),
+            "accountId": "gone",
+            "email": "gone",
+            "result": "success",
+        });
+        let mut kept = vec![stale];
+        kept.push(json!({
+            "ts": ts_at(0),
+            "accountId": "a",
+            "email": "a",
+            "result": "already",
+        }));
+        let filtered = normalize_checkin_logs(&kept, ts_at(1000));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].get("accountId"), Some(&json!("a")));
+    }
+
+    /// 配额紧张时的真实行为（已知限制，非缺陷修复）：
+    ///
+    /// `already` 行每轮都会被重新 append / 去重保最新（`normalize_checkin_logs` 保留
+    /// ts 最大的那条），因此在 500 条上限下，**同日的 success 行比 already 行先被丢掉**。
+    /// 有效保留期因此短于 `CHECKIN_LOG_KEEP_DAYS`（对 N 个账号约 500/(2N) 天，N=10 约
+    /// 25 天），但"今日已签"判定不受影响：签到成功的账号下一轮会拿到 already 回执
+    /// （`checkin::write_window_receipt`）。本用例把这个行为固定下来，避免有人误以为
+    /// 上限会按结果类型保护 success。
+    #[test]
+    fn checkin_logs_cap_drops_oldest_rows_regardless_of_result_type() {
+        let day_ms = local_timestamp_ms(2026, 9, 21, 12);
+        // 300 条较早的 success（账号互不相同，不参与 already 去重）+ 300 条较新的 already。
+        let mut logs: Vec<Value> = (0..300)
+            .map(|index| {
+                json!({
+                    "ts": day_ms - 300 * 60_000 + index as i64 * 60_000,
+                    "accountId": format!("s-{index}"),
+                    "email": format!("s-{index}"),
+                    "result": "success",
+                })
+            })
+            .collect();
+        logs.extend((0..300).map(|index| {
+            json!({
+                "ts": day_ms + index as i64 * 60_000,
+                "accountId": format!("a-{index}"),
+                "email": format!("a-{index}"),
+                "result": "already",
+            })
+        }));
+
+        let capped = normalize_checkin_logs(&logs, day_ms + 400 * 60_000);
+        assert_eq!(capped.len(), CHECKIN_LOG_MAX_RECORDS);
+        // 600 条超量 100 条 → 丢掉最早的 100 条 success；already 全部保住。
+        assert_eq!(capped[0].get("accountId"), Some(&json!("s-100")));
+        assert_eq!(
+            capped.last().and_then(|row| row.get("accountId")),
+            Some(&json!("a-299"))
+        );
+
+        // 同日的 success 与 already 同时存在时仍各自保留（去重只针对 already）。
+        let survivors_success = capped
+            .iter()
+            .filter(|row| row.get("result").and_then(Value::as_str) == Some("success"))
+            .count();
+        assert_eq!(survivors_success, 200);
+    }
+
+    /// 心跳：正常轮次清零连续 panic 计数，panic 时累加，缺失/损坏文件回落安全默认值。
+    #[test]
+    fn checkin_heartbeat_roundtrips_and_tolerates_missing_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-switch-checkin-heartbeat-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("checkin_heartbeat.json");
+
+        // 文件不存在：安全默认值，不 panic。
+        let missing = load_checkin_health_at(&path);
+        assert_eq!(missing.get("ts").and_then(Value::as_i64), Some(0));
+        assert_eq!(missing.get("last_status"), Some(&json!("unknown")));
+        assert_eq!(missing.get("file_exists"), Some(&json!(false)));
+        assert_eq!(missing.get("consecutive_panics"), Some(&json!(0)));
+        assert_eq!(missing.get("last_error"), Some(&Value::Null));
+
+        // 正常轮次。
+        let first = record_checkin_heartbeat_at(&path, 1_700_000_000_000, "ok", false, false, None);
+        assert_eq!(
+            first.get("ts").and_then(Value::as_i64),
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(first.get("consecutive_panics"), Some(&json!(0)));
+        assert_eq!(first.get("last_error"), Some(&Value::Null));
+        let loaded = load_checkin_health_at(&path);
+        assert_eq!(loaded.get("file_exists"), Some(&json!(true)));
+        assert_eq!(loaded.get("last_status"), Some(&json!("ok")));
+        assert_eq!(loaded.get("had_errors"), Some(&json!(false)));
+
+        // 连续 panic：计数累加，原因一并落盘。
+        let first_panic = record_checkin_heartbeat_at(
+            &path,
+            1_700_000_060_000,
+            "panic",
+            true,
+            true,
+            Some("task 12 panicked with message boom"),
+        );
+        assert_eq!(first_panic.get("consecutive_panics"), Some(&json!(1)));
+        let second_panic =
+            record_checkin_heartbeat_at(&path, 1_700_000_120_000, "panic", true, true, None);
+        assert_eq!(second_panic.get("consecutive_panics"), Some(&json!(2)));
+        assert_eq!(second_panic.get("panicked"), Some(&json!(true)));
+        assert_eq!(second_panic.get("had_errors"), Some(&json!(true)));
+        // 回读保留上一轮写入的原因（本次未带原因 → 写 null）。
+        assert_eq!(second_panic.get("last_error"), Some(&Value::Null));
+
+        // panic 原因会被截断到上限，避免心跳文件被超长文本撑大。
+        let long_error = "x".repeat(HEARTBEAT_ERROR_MAX_CHARS + 50);
+        let truncated = record_checkin_heartbeat_at(
+            &path,
+            1_700_000_150_000,
+            "panic",
+            true,
+            true,
+            Some(&long_error),
+        );
+        let kept_chars = truncated
+            .get("last_error")
+            .and_then(Value::as_str)
+            .map(|text| text.chars().count());
+        assert_eq!(kept_chars, Some(HEARTBEAT_ERROR_MAX_CHARS));
+
+        // 恢复正常 → 计数清零、原因清空。
+        let recovered =
+            record_checkin_heartbeat_at(&path, 1_700_000_180_000, "ok", false, false, None);
+        assert_eq!(recovered.get("consecutive_panics"), Some(&json!(0)));
+        assert_eq!(recovered.get("last_error"), Some(&Value::Null));
+
+        // 文件损坏：回落默认值；未知字段被丢弃。
+        std::fs::write(&path, "{not-json").unwrap();
+        let corrupt = load_checkin_health_at(&path);
+        assert_eq!(corrupt.get("last_status"), Some(&json!("unknown")));
+        assert_eq!(corrupt.get("ts").and_then(Value::as_i64), Some(0));
+        assert_eq!(corrupt.get("last_error"), Some(&Value::Null));
+
+        std::fs::write(
+            &path,
+            "{\"ts\": 42, \"last_status\": \"ok\", \"had_errors\": \"yes\", \"extra\": 1}",
+        )
+        .unwrap();
+        let partial = load_checkin_health_at(&path);
+        assert_eq!(partial.get("ts").and_then(Value::as_i64), Some(42));
+        assert_eq!(partial.get("last_status"), Some(&json!("ok")));
+        // 类型不符 → 保留默认值而不是沿用错误类型。
+        assert_eq!(partial.get("had_errors"), Some(&json!(false)));
+        assert!(partial.get("extra").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

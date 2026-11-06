@@ -32,6 +32,12 @@ import { Switch } from "@/components/ui/switch";
 import { TimePicker } from "@/components/ui/time-picker";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
+import {
+  checkinHeartbeatError,
+  checkinPanicWarning,
+  formatCheckinHeartbeat,
+  isCheckinHeartbeatStale,
+} from "@/lib/checkin-health";
 import { canPersistErrorLog } from "@/lib/error-report";
 import { setSessionsNavEnabled, useSessionsNavEnabled } from "@/lib/nav-prefs";
 import { setDefaultArchiveSyncEnabled, useDefaultArchiveSyncEnabled } from "@/lib/sync-prefs";
@@ -42,6 +48,7 @@ import type {
   AppNotification,
   AutoRotateConfig,
   CheckinConfig,
+  CheckinHealth,
   CheckinLog,
   GithubConfig,
   RateLimitConfig,
@@ -379,11 +386,32 @@ function AutoCheckinCard() {
   const logsOpen = openSections.includes("logs");
   const [logs, setLogs] = useState<CheckinLog[] | null>(null);
   const [logsError, setLogsError] = useState("");
+  /** 后台循环心跳：只用于展示「上一轮」，读取失败不影响配置编辑。 */
+  const [health, setHealth] = useState<CheckinHealth | null>(null);
+  /** 渲染用的「当前时刻」，由下方定时器推进（不要把 Date.now() 直接写进渲染）。 */
+  const [nowTick, setNowTick] = useState(() => Date.now());
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     void loadConfig();
+    void loadHealth();
+  }, []);
+
+  /**
+   * 每分钟推进一次「当前时刻」并重读心跳。
+   *
+   * 「上一轮：N 分钟前」与「超过 2 小时未更新」都依赖当前时间：只在渲染期取
+   * 一次 `Date.now()` 的话，页面长开时相对时间会永远停在挂载那一刻，超时高亮
+   * 也永远不会出现。心跳本身同样只在挂载与「全部立即签到」后读过，不重读就
+   * 看不到后台新跑的轮次。
+   */
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setNowTick(Date.now());
+      void loadHealth();
+    }, 60_000);
+    return () => clearInterval(timer);
   }, []);
 
   // 账号列表来自全局 store：为空时补拉一次（只取状态与账号，不拉积分）。
@@ -408,6 +436,20 @@ function AutoCheckinCard() {
       adoptSaved(loaded);
     } catch (e) {
       toast.error("自动签到配置加载失败", { description: api.asError(e) });
+    }
+  }
+
+  /**
+   * 读取后台循环心跳（「上一轮」展示）。
+   *
+   * 静默失败：心跳只是可观测性，读不到就不显示这一行，不能因此弹 toast
+   * 或影响配置编辑。
+   */
+  async function loadHealth() {
+    try {
+      setHealth(await api.getCheckinHealth());
+    } catch {
+      setHealth(null);
     }
   }
 
@@ -567,6 +609,7 @@ function AutoCheckinCard() {
       else if (allSkippedOrUnavailable) toast.info(text);
       else toast.success(text);
       void loadConfig();
+      void loadHealth();
       if (logsOpen) void loadLogs();
     } catch (e) {
       toast.error("签到失败", { description: api.asError(e) });
@@ -609,6 +652,11 @@ function AutoCheckinCard() {
   const checkinAccounts = accounts.filter((account) => variantSupportsCheckin(accountVariant(account)));
   const excludedIds = new Set(cfg?.excluded_account_ids ?? []);
   const windowIssue = cfg ? checkinWindowIssue(cfg.checkin_start, cfg.checkin_end) : null;
+  /** 渲染时刻：由 60s 定时器推进，心跳相对时间与「超时未更新」都按它计算。 */
+  const now = nowTick;
+  const healthStale = health !== null && isCheckinHeartbeatStale(health, now);
+  const panicWarning = health === null ? null : checkinPanicWarning(health);
+  const heartbeatError = health === null ? null : checkinHeartbeatError(health);
 
   return (
     <SettingsGroup
@@ -622,7 +670,39 @@ function AutoCheckinCard() {
               <AccordionSettingsRow
                 value="params"
                 label="启用自动签到"
-                description="为允许自动签到的账号核验状态并补签；可在下方按账号关闭"
+                description={
+                  <>
+                    为允许自动签到的账号核验状态并补签；可在下方按账号关闭
+                    {/* P1-1 可追溯性：开关是「默认回落」而非用户亲手打开时明确标注，
+                        避免旧配置导致的静默翻转无从解释。判据只剩配置文件存在，
+                        与签到日志无关，因此文案不得再提「历史签到记录」。 */}
+                    {cfg.enabled && cfg.enabled_source !== "user" && (
+                      <span className="mt-0.5 block text-amber-600">
+                        当前为自动启用：检测到旧版或损坏的配置文件，非你手动开启
+                      </span>
+                    )}
+                    {health && (
+                      <span
+                        className={cn(
+                          "mt-0.5 block",
+                          healthStale ? "text-amber-600" : undefined,
+                        )}
+                      >
+                        {formatCheckinHeartbeat(health, now)}
+                        {healthStale && "（超过 2 小时未更新，请确认 App 仍在运行）"}
+                      </span>
+                    )}
+                    {/* 单轮 panic 已被守护吞掉，连续多轮才提示重启（锁中毒后每轮都会 panic）。 */}
+                    {panicWarning && (
+                      <span className="mt-0.5 block text-amber-600">{panicWarning}</span>
+                    )}
+                    {heartbeatError && (
+                      <span className="mt-0.5 block break-all text-muted-foreground">
+                        失败原因：{heartbeatError}
+                      </span>
+                    )}
+                  </>
+                }
                 actions={
                   <>
                     <DemoAction>

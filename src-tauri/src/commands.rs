@@ -1117,16 +1117,38 @@ pub fn get_auto_checkin_config() -> Value {
 }
 
 /// POST /api/checkin/config —— 保存自动签到配置。
+///
+/// `enabled` 由关转开时立即跑一轮（与自动旅行的保存语义一致）：否则用户打开开关后
+/// 最长要等一个完整周期（30 分钟）才会发生第一次签到，期间关掉 App 就等于什么都没发生。
+/// 只在 false→true 触发——修改时间段 / 排除名单也走本入口，不能每次保存都发一轮请求。
 #[tauri::command]
 pub fn save_auto_checkin_config(config: Value) -> Result<Value, String> {
+    let before = crate::modules::config::load_checkin_config();
     crate::modules::config::save_checkin_config(&config).map_err(|e| e.to_string())?;
-    Ok(crate::modules::config::load_checkin_config())
+    let saved = crate::modules::config::load_checkin_config();
+    let was_enabled = before.get("enabled").and_then(Value::as_bool) == Some(true);
+    if !was_enabled && saved.get("enabled").and_then(Value::as_bool) == Some(true) {
+        // 抢不到 RunFlagGuard 时 run_checkin_cycle 自行返回 already_running，无需额外防重入。
+        tauri::async_runtime::spawn(async {
+            let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
+        });
+    }
+    Ok(saved)
 }
 
 /// GET /api/checkin/logs —— 签到日志（每行带 `variant`，便于前端按档位过滤）。
 #[tauri::command]
 pub fn get_checkin_logs() -> Value {
     json!({ "logs": checkin::load_checkin_logs_with_variant() })
+}
+
+/// GET /api/checkin/health —— 自动签到循环心跳（设置页「上一轮」展示用）。
+///
+/// 只读：文件缺失或损坏时 core 返回安全默认值（`ts: 0` / `last_status: "unknown"`），
+/// 因此这里不需要错误分支。
+#[tauri::command]
+pub fn get_checkin_health() -> Value {
+    crate::modules::config::load_checkin_health()
 }
 
 // ---------------------------------------------------------------------------
