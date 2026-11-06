@@ -671,7 +671,10 @@ fn record_checkin_heartbeat_at(
         "last_error": null,
     });
     if let Some(error) = last_error {
-        heartbeat["last_error"] = json!(error);
+        // 截断下沉到唯一的写盘入口：`record_checkin_failure_heartbeat` 在外层也截一次，
+        // 但任何直接调用本函数的新代码都不该能把心跳文件撑大。
+        let truncated: String = error.chars().take(HEARTBEAT_ERROR_MAX_CHARS).collect();
+        heartbeat["last_error"] = json!(truncated);
     }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
