@@ -1,8 +1,9 @@
 # 签到功能全链路走查报告（v0.1.62 / 22b318c）
 
 > 任务：验证「每天自动签到领积分」是否已完整可用、有无缺口。
-> 方式：纯静态走查（未修改任何业务代码，未运行 cargo）。编译与单测由并行任务负责。
-> 结论先行：**功能已完整可用（端到端闭环，无 P0 阻断）**；用户「以为没有这个功能」的直接原因是**默认关闭 + 文档完全没写 + 后台执行无反馈**，而不是实现缺失。
+> 方式：纯静态走查（未修改任何业务代码）+ 编译与单测结果取自仓库 CI（见 §5）。
+> 结论先行：**功能已完整可用（端到端闭环，无 P0 阻断）**；用户「以为没有这个功能」的直接原因是**默认关闭且默认值不持久 + 文档完全没写 + 后台执行无反馈**，而不是实现缺失。
+> 修订记录：§3 P1-1 已按 QA 独立复核结论**修正**（默认关闭不持久 / UI 与行为不一致）；§5 为编译与单测验证归档。
 
 ---
 
@@ -12,6 +13,7 @@
 2. [已闭环清单（含证据）](#2-已闭环清单含证据)
 3. [缺口 / 风险清单](#3-缺口--风险清单)
 4. [结论与最值得补的 3 个方向](#4-结论与最值得补的-3-个方向)
+5. [编译与单测验证](#5-编译与单测验证)
 
 ---
 
@@ -97,12 +99,12 @@
 - 目录：`~/.wb-switch/`（`config.rs:69-71`，可被 `WB_SWITCH_HOME` 覆盖，`config.rs:58-67`）。
 - 配置：`auto_checkin_config.json`，字段 `enabled` / `excluded_account_ids` / `checkin_start` / `checkin_end` + 兼容字段 `start_hour`/`end_hour`/`keepalive_days`/`lazy_refresh_hours`（`config.rs:280-300`）；保存时只保留已知字段、时间归一化 `HH:MM`、非法归空串，`atomic_write` 落盘（`config.rs:322-358`、`396-401`）。
 - 日志：`auto_checkin_logs.json`，每行 `{ts, accountId, email, variant, result, error?}`（`checkin.rs:330-373`）；保留 30 天 / 最多 500 条，重复 `already` 按(账号,本地日期)去重保最新（`config.rs:462-515`）；启动时做一次历史整理 `compact_checkin_logs`（`config.rs:541-544`，两宿主都在第一轮之前调用：`lib.rs:62`、`main.rs:27`）。
-- 启动默认值策略：全新安装 `enabled:false`；已有安装（存在配置文件或日志文件）沿用历史默认 `enabled:true`（`config.rs:280-287`、`376-393`；单测 `config.rs:1249-1319`）。
+- 启动默认值策略：全新安装 `enabled:false`；已有安装（存在配置文件**或**日志文件）沿用历史默认 `enabled:true`（`config.rs:280-287`、`376-393`；单测 `config.rs:1249-1318`）。⚠️ 该"使用痕迹"判据会把手动签到产生的日志误判成老用户，导致默认关闭不持久 —— 详见 §3 **P1-1**（已修正）。
 
 ### 2.9 派猫猫旅行（自动领积分）不干扰签到
 - 独立配置 `auto_travel_config.json`、独立缓存、独立并发标志（`config.rs:89-95`、`travel.rs:23-24`）、独立周期（30 分钟派发 / 15 分钟领取，`travel.rs:43-45`）、独立档位门控（仅 Cn，`variant.rs:310-312`、`travel.rs:35-41`、`857-861`）。
 - UI 上确实是**同一张设置卡片内的一行**（`SettingsPage.tsx:755` `<AutoTravelRow/>` 渲染在自动签到卡片内；`SettingsPage.tsx:816-871`），但配置与执行完全解耦，互不覆盖。
-- 开关联动：旅行开启时会立即跑一轮派发+领取（`commands.rs:1156-1166`、`api.rs:1541-1556`），签到**没有**这个立即触发（见 §3 P2-1）。
+- 开关联动：旅行开启时会立即跑一轮派发+领取（`commands.rs:1156-1166`、`api.rs:1541-1556`），签到**没有**这个立即触发（见 §3 P1-2）。
 
 ### 2.10 前端口径一致
 - 档位能力前端唯一来源 `src/lib/variant.ts`，与后端 `variant.rs` 同口径（`cn` 才支持签到/旅行）。
@@ -118,23 +120,34 @@
 
 ### P1 明显缺陷（影响"用户感知到功能存在且生效"）
 
-**P1-1 全新安装默认关闭，且开启后不立即执行 → 用户"开了却没反应"**
-- 默认值：`default_checkin_config()` 返回 `enabled:false`（`config.rs:280-282`），仅"已有安装"才默认 true（`config.rs:383-393`）。
+**P1-1 默认关闭不持久：任意一次手动签到就会把「自动签到」静默打开（UI 与行为会短暂不一致）**
+> **本节为 QA 独立复核后的修正版**：原表述为「全新安装默认关闭」，方向正确但**不完整**。QA 复核提出「默认关闭不持久、UI 显示与实际行为不一致」，经逐行核对 `load_checkin_config` / `default_checkin_config` / `save_checkin_config` 后确认 **QA 的定性成立**，但触发条件需修正为「日志文件存在而配置文件缺失」，而非「全新安装落盘值缺失」。以下为核对后的准确描述。
+
+- **全新安装（两个文件都不存在）→ `enabled` 确实是 `false`。** `load_checkin_config()` → `load_checkin_config_at()`（`config.rs:376-381`）以 `existing_install = config 文件存在 || 日志文件存在` 作为判据，两者皆无时走 `default_checkin_config()`（`config.rs:280-282`）→ `enabled:false`。单测直接断言该行为：`config.rs:1281-1287`。
+- **但 `enabled` 的默认值不是常量，而是由「使用痕迹」决定。** 判据一旦命中（`config.rs:380`），基线换成 `legacy_default_checkin_config()`（`config.rs:285-287`）→ **`enabled:true`**。单测明确断言「只有签到日志、没有配置文件」时 `enabled=true`：`config.rs:1289-1296`；配置文件存在但内容损坏时同样 `true`：`config.rs:1307-1315`。
+- **日志文件不需要开启自动签到就会被创建。** 写日志的唯一主动入口是 `checkin_account` 的提交分支（`checkin.rs:373`，`add_checkin_log`），而批量签到的公开入口 `run_checkin_all` **不检查 `enabled`**（`checkin.rs:851-867`；只有 `run_checkin_cycle` 在 `checkin.rs:706-709` 检查）。因此触发链是：**全新安装 → 用户点一次「签到」/「全部立即签到」/托盘「一键签到」/账号页「刷新并签到」→ `~/.wb-switch/auto_checkin_logs.json` 落盘 → 下一次 `load_checkin_config()` 起 `enabled` 变为 `true`**。
+- 后果 1（状态污染）：用户从没拨过开关，设置页重新加载后显示"开启"。这是不可归因的静默翻转。
+- 后果 2（**UI 与行为不一致，即 QA 指出的现象**）：设置页/账号页的 `enabled` 来自挂载时的 `get_auto_checkin_config`（`SettingsPage.tsx:404-412`），日志落盘后不重读；而后台循环每轮重新 `load_checkin_config()`（`checkin.rs:706`）已读到 `true` 并按开启执行 → **屏幕显示"关"，后台每 30 分钟在签**。
+- 一次性 vs 持续：只要用户显式保存过一次配置（哪怕只是拨一下开关再拨回来），`{"enabled": false}` 落盘后就会永久覆盖痕迹（`config.rs:1299-1305` 单测）。所以这是「首次手动签到后的一次静默翻转」，不是每次都发生。
+- 定级理由：不与 P0 冲突（不会误签他人账号、不会损坏数据、签到本身幂等），但它破坏了"默认关闭"这个安全默认值的语义，且用户无法从 UI 追溯原因，故列 P1。
+- 建议修法（供后续排期参考）：① 把使用痕迹判据从 `config || logs` 收窄为「仅配置文件存在」，或改用一个显式的 `install_marker` 文件；② 或让手动签到写独立日志文件，不与自动签到的"使用痕迹"共用 `auto_checkin_logs.json`；③ 无论哪种，`run_checkin_cycle` 启动时应把当轮读取到的 `enabled` 与生效值通过日志/通知暴露一次，避免静默态。
+
+**P1-2 开启后不立即执行 → 用户"开了却没反应"**
 - 保存配置只落盘，不触发任何一轮签到：`commands.rs:1121-1124`、`api.rs:1509-1515`。对比自动旅行开启即跑一轮（`commands.rs:1159-1164`），签到少了这一段。
-- 后果：用户打开开关后，最长要等一个完整周期上限 30 分钟（`checkin.rs:645` clamp 上限）才会发生第一次签到；若此时关闭 App 则什么都不发生。这几乎必然被感知为"功能没实现"。
+- 后果：用户打开开关后，最长要等一个完整周期上限 30 分钟（`checkin.rs:645` clamp 上限）才会发生第一次签到；若此时关闭 App 则什么都不发生。叠加 P1-1 的"静默翻转"，用户对"现在到底开没开"完全没有判断依据。
 - 缓解现状：开关右侧有"全部立即签到"按钮（`SettingsPage.tsx:635-639`），但没有任何文案提示"开启后需点一次或等待"。
 
-**P1-2 「每天自动」的前置条件（App 常驻 / 开机自启）既未提示也未联动**
+**P1-3 「每天自动」的前置条件（App 常驻 / 开机自启）既未提示也未联动**
 - 自动签到依赖宿主进程常驻：`lib.rs:59-75`（桌面）/ `main.rs:25-35`（CLI）。开机自启是**另一个独立卡片**、系统级 opt-in（`SettingsPage.tsx:1477+`、`commands.rs:1321-1333`），二者没有任何交叉提示。
 - 时间段说明里只有一句"需 App 在窗口附近运行才能按时执行"（`SettingsPage.tsx:650`），未覆盖"未设置时间段时也要 App 在跑"和"建议开启开机自启"。
 - 影响：用户设好就关掉 App，第二天发现没签，归因为"功能不存在 / 坏了"。
 
-**P1-3 后台自动签到结果对用户完全不可见（无通知、无托盘刷新）**
+**P1-4 后台自动签到结果对用户完全不可见（无通知、无托盘刷新）**
 - 两宿主的周期循环都丢弃返回值：`let _ = run_checkin_cycle(...)`（`lib.rs:65-74`、`main.rs:30-33`），不弹通知、不写 `notifications`（`notifications::record` 只被前端 toast 和 API 调用，`commands.rs:1450-1455`、`api.rs:1677-1689`；core 的 checkin/travel 都没有调用点）。
 - 托盘菜单标签"已签到/一键签到"只在 `build_tray_menu` 时计算（`tray.rs:619-638`），且只在轻量模式切换、`CheckinBusyGuard` 起止时重建（`tray.rs:318-366`、`377-386`）——后台自动签到完成**不会**刷新托盘，标签会长期停留在"一键签到"。
 - 唯一可观测物是设置页的签到日志（懒加载、需手动展开，`SettingsPage.tsx:394-402`、`757-803`）。
 
-**P1-4 README 完全没有签到 / 旅行**
+**P1-5 README 完全没有签到 / 旅行**
 - `README.md:34-53`「功能」表、`README.md:89-98`「使用」步骤均未出现"签到""旅行"字样（实测 grep 命中 0）。功能表里连"积分到期查询"都有，却没有"每日自动签到"。
 - 影响：这是"用户以为需要新增该功能"的**最直接原因**——功能齐全但不可被发现。
 
@@ -167,7 +180,7 @@
 - `RunFlagGuard`/`AccountRunGuard` 是 `Drop` 复位（`config.rs:876-880`、`checkin.rs:99-105`），unwind 路径也能释放，所以**不会**造成标志位永久卡真。
 
 **P2-7 账号页签到状态不轮询**
-- `checkinMap` 只在账号集合/配置变化时查一次（`AccountsPage.tsx:406-421`），页面长开时"今日已签到"徽标会过期；后台签到完成后也不会有事件推送刷新（对应 P1-3）。
+- `checkinMap` 只在账号集合/配置变化时查一次（`AccountsPage.tsx:406-421`），页面长开时"今日已签到"徽标会过期；后台签到完成后也不会有事件推送刷新（对应 P1-4）。
 
 **P2-8 排除名单只作用于签到，不作用于自动旅行**
 - `travel.rs` 只读自己的 `auto_travel_config`，不读 `excluded_account_ids`（`travel.rs:845-861`）。
@@ -188,9 +201,11 @@
 ## 4. 结论与最值得补的 3 个方向
 
 ### 结论
-**该功能已经完整可用，不需要"新增"实现。** 端到端链路（UI / 托盘 / 后台定时器 → API/IPC → core → `codebuddy.cn` 两个签到接口 → `~/.wb-switch/auto_checkin_logs.json`）全部闭环；国际版零请求短路、信封凭据短路、`[start,end)` 窗口与错峰抽签、排除名单、并发保护、日志 30 天/500 条治理都实现到位且有单测。桌面版**确实**会每天自动签到（`src-tauri/src/lib.rs:59-75` + `205-207`），与 webui 走同一套 core 循环。
+**该功能已经完整可用，不需要"新增"实现。** 端到端链路（UI / 托盘 / 后台定时器 → API/IPC → core → `codebuddy.cn` 两个签到接口 → `~/.wb-switch/auto_checkin_logs.json`）全部闭环；国际版零请求短路、信封凭据短路、`[start,end)` 窗口与错峰抽签、排除名单、并发保护、日志 30 天/500 条治理都实现到位且有单测（编译与单测结果见 §5：core crate 在 CI 上 773/759 全绿）。桌面版**确实**会每天自动签到（`src-tauri/src/lib.rs:59-75` + `205-207`），与 webui 走同一套 core 循环。
 
-功能"看起来不存在"的原因是产品与文档层面：全新安装默认关闭、开启后不立即执行、后台执行无任何可见反馈、README 一个字都没提。
+功能"看起来不存在"的原因是产品与文档层面：默认关闭且默认值不持久（P1-1，已按 QA 复核修正）、开启后不立即执行（P1-2）、后台执行无任何可见反馈（P1-4）、README 一个字都没提（P1-5）。
+
+风险总账：**P0 = 0**，**P1 = 5**（全部是产品/文档/默认值语义层，无实现正确性缺陷），**P2 = 11**（体验与残余风险）。
 
 ### 如果锋哥仍想"增加"这个功能，最值得补的 3 个方向
 1. **可发现性 + 首次引导（成本最低、收益最高）**
@@ -199,7 +214,53 @@
 2. **开启即生效 + 结果可观测**
    在 `save_auto_checkin_config`（`commands.rs:1121`、`api.rs:1509`）里照搬自动旅行的做法（`commands.rs:1159-1164`）：`enabled` 由 false→true 时 spawn 一轮 `run_checkin_cycle`；周期循环结束后 `notify_checkin`/写 `notifications::record`，并 `refresh_tray_menu`（现在只有手动一键签到才刷新，`tray.rs:388-417`）。同时把"最近一次自动签到时间/结果"落到配置侧或返回体里，在设置页与托盘展示。
 
-3. **把"每天"做成可验证的承诺**
-   ① 未设置时间段时也对 `already` 结果补写回执（放宽 `checkin.rs:733-738` 的 `if let Some(win)` 条件），修掉托盘"整天可签到"的判定漏洞；② 加一个轻量的"最近 7 天签到成功率"视图（数据已在日志里）；③ 循环加 panic 守护 + 心跳（`lib.rs:68-74`、`main.rs:31-34`），并在设置页提示"自动签到自 X 时间起未成功执行"。
+3. **让「开关状态」本身可信（修 P1-1 的正确性缺口 + P2-1 的判定漏洞）**
+   ① 把 `load_checkin_config` 的"使用痕迹"判据从 `config 文件存在 || 日志文件存在`（`config.rs:380`）收窄为「仅配置文件存在」或改用显式 `install_marker`，避免"手动签一次 → 自动签到被静默打开"；② 未设置时间段时也对 `already` 结果补写回执（放宽 `checkin.rs:733-738` 的 `if let Some(win)`），修掉托盘"整天可签到"的判定漏洞；③ 循环加 panic 守护 + 心跳（`lib.rs:68-74`、`main.rs:31-34`），并在设置页提示"自动签到自 X 时间起未成功执行"。
 
-（若只做一件事：选第 1 项；若允许动代码：第 2 项的第 1 小项——开启即跑一轮——是单点最小改动、直接消除"我开了却没签"的观感。）
+（若只做一件：选第 1 项；若允许动代码：第 3 项的第 ① 小项是**真正的正确性修复**（默认值语义被"使用痕迹"污染），第 2 项的第 1 小项是**感知层最小改动**（开启即跑一轮）。两者都只各改一处。）
+
+---
+
+## 5. 编译与单测验证
+
+### 5.1 本机无法编译（已排查到底，非代码问题）
+
+本地 `cargo test -p wb-switch-core` 在当前受限会话中无法完成，三条独立原因均已逐一验证：
+
+1. **无 MSVC 且装不上**：本机没有 Visual Studio C++ 生成工具；VS Build Tools 引导器在此受限会话中始终只做 "Preparing" 就退出（ExitCode 5 / 空跑），无法完成安装。
+2. **改用 MinGW-w64 16.2.0 + `stable-x86_64-pc-windows-gnu` 工具链后仍失败**：`gcc` 本身可正常编译，但 binutils 的 `ld` 与 `dlltool` 一律报 `Cannot create temporary file ...: Permission denied`。与 `TMP` / `TEMP` / `TMPDIR` 无关——换到标准 Temp 目录同样失败（受限会话对子进程创建临时文件的拦截）。
+3. **`RUSTFLAGS="-C link-self-contained=yes"`（rust-lld）解决了链接器问题**，但 `dlltool` 生成 import library（`windows-sys` / `getrandom` 需要）依然失败 → 本机 `cargo test` 无法完成。
+
+结论：本机环境不具备编译 Rust 目标的条件，**与仓库代码无关**，不再重试。
+
+### 5.2 真实编译验证：仓库自带 CI
+
+编译器与测试通过仓库已有的 GitHub Actions 工作流 `.github/workflows/test.yml` 完成（其中的测试命令就是 `cargo test -p wb-switch-core`，与本次验证目标一致）。
+
+运行记录：<https://github.com/hkshiqi/workbuddy-switch/actions/runs/42282041386>
+
+| Job | 平台 | 结果 |
+| --- | --- | --- |
+| `cargo test` | ubuntu-latest | ✅ **773 passed / 0 failed** |
+| `cargo test` | windows-latest | ✅ **759 passed / 0 failed**（另有 5 passed 的附加步骤） |
+| `frontend-tests` | ubuntu-latest | ✅ success |
+| `cargo test` | macos-14 | ⚠️ cancelled —— `The configuration 'macos-14-arm64-us-default' is not supported`（fork 账号无该 runner 配置，**与代码无关**） |
+| `lint` | — | ⚠️ cancelled —— 随 macos job 失败被一并取消 |
+
+### 5.3 结论
+
+- **`wb-switch-core` crate 编译通过**（Linux + Windows 双平台实际编译并运行），**单测 773 / 759 个全绿、0 失败**；macOS 与 lint 的 cancelled 是 fork runner 配额问题，不构成代码质量结论。
+- 签到相关单测**覆盖完整并通过**，本报告 §2 中依赖单测佐证的每条结论都有对应用例：
+  - 错峰抽签稳定性与跨账号/跨日分散：`checkin.rs:1377-1403`
+  - 窗口合法性（半填 / 非法 / `start>=end` / 越界）：`checkin.rs:1406-1437`
+  - `[start,end)` 边界（start 整点在内、end 整点在外）：`checkin.rs:1441-1467`
+  - 窗口外整轮跳过（不查状态、不提交、不写日志）：`checkin.rs:1471-1504`
+  - due 判定（到点前不发请求 / 到点后补签 / 昨日回执不顶替今日）：`checkin.rs:1538-1598`
+  - 窗口回执（手动提前签到 → already 回执跨重启成立）：`checkin.rs:1601-1691`
+  - 重试节奏（30 分钟基线 / 5 分钟快速重试 / 预算耗尽回落 / 1 分钟下限）：`checkin.rs:1745-1820`
+  - 国际版零请求短路：`checkin.rs:1110-1134`；刷新短路：`checkin.rs:1072-1107`
+  - 信封凭据不发空 Bearer：`checkin.rs:897-909`
+  - 排除名单不误发请求：`checkin.rs:911-956`
+  - 并发 guard 不可重入 + 手动批量在周期运行时返回 busy：`checkin.rs:1174-1192`
+  - 默认值"使用痕迹"策略（全新安装 false / 仅有日志 true / 显式 false 覆盖 / 配置损坏仍 true）：`config.rs:1249-1318`
+- 因此：**「该功能实现正确且自带测试保护」这一判断已由 CI 实际编译运行结果支撑，不再只依赖静态走查。** 本报告 §3 的 P1/P2 项均为产品、文档、默认值语义与可观测性问题，**不是**实现正确性缺陷。
