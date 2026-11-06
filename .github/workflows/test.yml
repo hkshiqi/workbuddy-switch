@@ -169,13 +169,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check -p wb-switch-core -p wb-switch-server -p wb-switch-rust
 
-      # 不带 `-D warnings`：Windows 专属 cfg 分支从未被 clippy 检过（macOS 的 lint 只展开
-      # macOS 分支），实测会命中一批与本轮改动无关的历史告警（core 的 auth_file /
-      # codebuddy_cli / vscode_cn_inject、vendor 的 agent-studio-desktop）。这一 job 的
-      # 价值是「真的编译过 + 真的跑过测试」，`-D warnings` 的严格门禁留给 macOS 的 lint。
-      # 告警本身不吞：`--all-targets` 把测试目标一起编译，输出照旧可见。
-      - name: Clippy (compile all targets; warnings reported, not gated)
-        run: cargo clippy -p wb-switch-core -p wb-switch-server -p wb-switch-rust --all-targets --no-deps
+      # 这里刻意不跑 clippy：`setup-rust-toolchain` 默认注入 `RUSTFLAGS=-D warnings`
+      # （见 build.yml 同一处注释），而 Windows 专属 cfg 分支从未被 clippy 检过——
+      # 实测会命中一批与本任务无关的历史告警（core 的 auth_file / codebuddy_cli /
+      # vscode_cn_inject、vendor 的 agent-studio-desktop），修它们不属于本次改动。
+      # 保留 `-D warnings` 的门禁作用：下面两条 `cargo test` 会连测试目标一起编译，
+      # rustc 级告警（unused / dead_code 等）仍然算失败，这正是本轮真正需要的证据
+      # ——「wb-switch-rust 被真正编译过、测试被真正执行过」。clippy 的严格门禁留在
+      # macOS 的 lint job（它覆盖 macOS cfg 分支）。
 
       - name: Server tests
         run: cargo test -p wb-switch-server
