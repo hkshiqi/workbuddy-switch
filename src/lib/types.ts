@@ -468,6 +468,8 @@ export interface CheckinHealth {
   panicked: boolean;
   /** 连续 panic 轮数；正常轮次清零。 */
   consecutive_panics: number;
+  /** 上一轮的失败原因（panic 守护写入，后端已截断到 300 字符）；正常轮次为 null。 */
+  last_error?: string | null;
   /** 心跳文件是否存在（从未跑过为 false）。 */
   file_exists?: boolean;
 }

@@ -447,6 +447,7 @@ function checkinHealth(): CheckinHealth {
     had_errors: false,
     panicked: false,
     consecutive_panics: 0,
+    last_error: null,
     file_exists: true,
   };
 }

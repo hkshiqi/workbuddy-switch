@@ -603,8 +603,12 @@ fn checkin_heartbeat_default() -> Value {
         "had_errors": false,
         "panicked": false,
         "consecutive_panics": 0,
+        "last_error": null,
     })
 }
+
+/// 心跳里保存的失败原因上限（panic 文本可能带很长 backtrace 描述）。
+const HEARTBEAT_ERROR_MAX_CHARS: usize = 300;
 
 /// 读取心跳文件（按字段白名单逐项校验，缺失/类型不符的字段回落默认值）。
 fn read_checkin_heartbeat_at(path: &Path) -> Value {
@@ -630,6 +634,13 @@ fn read_checkin_heartbeat_at(path: &Path) -> Value {
     if let Some(count) = map.get("consecutive_panics").and_then(Value::as_i64) {
         heartbeat["consecutive_panics"] = json!(count.max(0));
     }
+    if let Some(error) = map
+        .get("last_error")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        heartbeat["last_error"] = json!(error);
+    }
     heartbeat
 }
 
@@ -639,6 +650,7 @@ fn record_checkin_heartbeat_at(
     status: &str,
     had_errors: bool,
     panicked: bool,
+    last_error: Option<&str>,
 ) -> Value {
     let previous = read_checkin_heartbeat_at(path);
     let previous_panics = previous
@@ -650,13 +662,17 @@ fn record_checkin_heartbeat_at(
     } else {
         0
     };
-    let heartbeat = json!({
+    let mut heartbeat = json!({
         "ts": at_ms,
         "last_status": status,
         "had_errors": had_errors,
         "panicked": panicked,
         "consecutive_panics": consecutive_panics,
+        "last_error": null,
     });
+    if let Some(error) = last_error {
+        heartbeat["last_error"] = json!(error);
+    }
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -678,6 +694,23 @@ pub fn record_checkin_heartbeat(status: &str, had_errors: bool, panicked: bool) 
         status,
         had_errors,
         panicked,
+        None,
+    )
+}
+
+/// 记录一轮被守护捕获的失败心跳，并把 panic 原因一并落盘。
+///
+/// 原因来自 `JoinError::to_string()`：不落盘的话宿主会 `let _ =` 丢掉返回值，
+/// 用户只能看到「异常」而无法反馈具体原因。
+pub fn record_checkin_failure_heartbeat(status: &str, panicked: bool, last_error: &str) -> Value {
+    let truncated: String = last_error.chars().take(HEARTBEAT_ERROR_MAX_CHARS).collect();
+    record_checkin_heartbeat_at(
+        &checkin_heartbeat_file(),
+        now_ms(),
+        status,
+        true,
+        panicked,
+        Some(&truncated),
     )
 }
 
@@ -1596,6 +1629,54 @@ mod tests {
         assert_eq!(filtered[0].get("accountId"), Some(&json!("a")));
     }
 
+    /// 配额紧张时的真实行为（已知限制，非缺陷修复）：
+    ///
+    /// `already` 行每轮都会被重新 append / 去重保最新（`normalize_checkin_logs` 保留
+    /// ts 最大的那条），因此在 500 条上限下，**同日的 success 行比 already 行先被丢掉**。
+    /// 有效保留期因此短于 `CHECKIN_LOG_KEEP_DAYS`（对 N 个账号约 500/(2N) 天，N=10 约
+    /// 25 天），但"今日已签"判定不受影响：签到成功的账号下一轮会拿到 already 回执
+    /// （`checkin::write_window_receipt`）。本用例把这个行为固定下来，避免有人误以为
+    /// 上限会按结果类型保护 success。
+    #[test]
+    fn checkin_logs_cap_drops_oldest_rows_regardless_of_result_type() {
+        let day_ms = local_timestamp_ms(2026, 9, 21, 12);
+        // 300 条较早的 success（账号互不相同，不参与 already 去重）+ 300 条较新的 already。
+        let mut logs: Vec<Value> = (0..300)
+            .map(|index| {
+                json!({
+                    "ts": day_ms - 300 * 60_000 + index as i64 * 60_000,
+                    "accountId": format!("s-{index}"),
+                    "email": format!("s-{index}"),
+                    "result": "success",
+                })
+            })
+            .collect();
+        logs.extend((0..300).map(|index| {
+            json!({
+                "ts": day_ms + index as i64 * 60_000,
+                "accountId": format!("a-{index}"),
+                "email": format!("a-{index}"),
+                "result": "already",
+            })
+        }));
+
+        let capped = normalize_checkin_logs(&logs, day_ms + 400 * 60_000);
+        assert_eq!(capped.len(), CHECKIN_LOG_MAX_RECORDS);
+        // 600 条超量 100 条 → 丢掉最早的 100 条 success；already 全部保住。
+        assert_eq!(capped[0].get("accountId"), Some(&json!("s-100")));
+        assert_eq!(
+            capped.last().and_then(|row| row.get("accountId")),
+            Some(&json!("a-299"))
+        );
+
+        // 同日的 success 与 already 同时存在时仍各自保留（去重只针对 already）。
+        let survivors_success = capped
+            .iter()
+            .filter(|row| row.get("result").and_then(Value::as_str) == Some("success"))
+            .count();
+        assert_eq!(survivors_success, 200);
+    }
+
     /// 心跳：正常轮次清零连续 panic 计数，panic 时累加，缺失/损坏文件回落安全默认值。
     #[test]
     fn checkin_heartbeat_roundtrips_and_tolerates_missing_files() {
@@ -1612,38 +1693,67 @@ mod tests {
         assert_eq!(missing.get("last_status"), Some(&json!("unknown")));
         assert_eq!(missing.get("file_exists"), Some(&json!(false)));
         assert_eq!(missing.get("consecutive_panics"), Some(&json!(0)));
+        assert_eq!(missing.get("last_error"), Some(&Value::Null));
 
         // 正常轮次。
-        let first = record_checkin_heartbeat_at(&path, 1_700_000_000_000, "ok", false, false);
+        let first = record_checkin_heartbeat_at(&path, 1_700_000_000_000, "ok", false, false, None);
         assert_eq!(
             first.get("ts").and_then(Value::as_i64),
             Some(1_700_000_000_000)
         );
         assert_eq!(first.get("consecutive_panics"), Some(&json!(0)));
+        assert_eq!(first.get("last_error"), Some(&Value::Null));
         let loaded = load_checkin_health_at(&path);
         assert_eq!(loaded.get("file_exists"), Some(&json!(true)));
         assert_eq!(loaded.get("last_status"), Some(&json!("ok")));
         assert_eq!(loaded.get("had_errors"), Some(&json!(false)));
 
-        // 连续 panic：计数累加。
-        let first_panic =
-            record_checkin_heartbeat_at(&path, 1_700_000_060_000, "panic", true, true);
+        // 连续 panic：计数累加，原因一并落盘。
+        let first_panic = record_checkin_heartbeat_at(
+            &path,
+            1_700_000_060_000,
+            "panic",
+            true,
+            true,
+            Some("task 12 panicked with message boom"),
+        );
         assert_eq!(first_panic.get("consecutive_panics"), Some(&json!(1)));
         let second_panic =
-            record_checkin_heartbeat_at(&path, 1_700_000_120_000, "panic", true, true);
+            record_checkin_heartbeat_at(&path, 1_700_000_120_000, "panic", true, true, None);
         assert_eq!(second_panic.get("consecutive_panics"), Some(&json!(2)));
         assert_eq!(second_panic.get("panicked"), Some(&json!(true)));
         assert_eq!(second_panic.get("had_errors"), Some(&json!(true)));
+        // 回读保留上一轮写入的原因（本次未带原因 → 写 null）。
+        assert_eq!(second_panic.get("last_error"), Some(&Value::Null));
 
-        // 恢复正常 → 计数清零。
-        let recovered = record_checkin_heartbeat_at(&path, 1_700_000_180_000, "ok", false, false);
+        // panic 原因会被截断到上限，避免心跳文件被超长文本撑大。
+        let long_error = "x".repeat(HEARTBEAT_ERROR_MAX_CHARS + 50);
+        let truncated = record_checkin_heartbeat_at(
+            &path,
+            1_700_000_150_000,
+            "panic",
+            true,
+            true,
+            Some(&long_error),
+        );
+        let kept_chars = truncated
+            .get("last_error")
+            .and_then(Value::as_str)
+            .map(|text| text.chars().count());
+        assert_eq!(kept_chars, Some(HEARTBEAT_ERROR_MAX_CHARS));
+
+        // 恢复正常 → 计数清零、原因清空。
+        let recovered =
+            record_checkin_heartbeat_at(&path, 1_700_000_180_000, "ok", false, false, None);
         assert_eq!(recovered.get("consecutive_panics"), Some(&json!(0)));
+        assert_eq!(recovered.get("last_error"), Some(&Value::Null));
 
         // 文件损坏：回落默认值；未知字段被丢弃。
         std::fs::write(&path, "{not-json").unwrap();
         let corrupt = load_checkin_health_at(&path);
         assert_eq!(corrupt.get("last_status"), Some(&json!("unknown")));
         assert_eq!(corrupt.get("ts").and_then(Value::as_i64), Some(0));
+        assert_eq!(corrupt.get("last_error"), Some(&Value::Null));
 
         std::fs::write(
             &path,

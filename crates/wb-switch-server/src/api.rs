@@ -1509,8 +1509,21 @@ async fn api_checkin_config() -> Response {
 
 async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
     let submitted = body.get("config").unwrap_or(&body);
+    // 与自动旅行保存同语义：enabled 由关转开时立即跑一轮，避免「开了开关却要等 30 分钟」。
+    // 只在 false→true 触发，改时间段 / 排除名单不会白白发请求。
+    let before = config::load_checkin_config();
     match config::save_checkin_config(submitted) {
-        Ok(()) => json_ok(config::load_checkin_config()),
+        Ok(()) => {
+            let saved = config::load_checkin_config();
+            let was_enabled = before.get("enabled").and_then(Value::as_bool) == Some(true);
+            if !was_enabled && saved.get("enabled").and_then(Value::as_bool) == Some(true) {
+                tokio::spawn(async {
+                    let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery)
+                        .await;
+                });
+            }
+            json_ok(saved)
+        }
         Err(e) => json_err(e.to_string(), StatusCode::BAD_REQUEST),
     }
 }
