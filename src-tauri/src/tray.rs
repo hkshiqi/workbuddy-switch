@@ -1043,6 +1043,14 @@ mod tests {
     };
     use serde_json::json;
 
+    // Windows 专属用例（`taskbar_theme_is_readable_on_windows`）要用的函数。
+    // 必须用 cfg 门住：该函数本身是 `#[cfg(windows)]`，无条件导入会让 macOS 上
+    // 报「未使用」。缺这行时那条用例在 Windows 上根本编译不过——`wb-switch-rust`
+    // 此前没有任何 job 在 Windows 上编译过，所以一直没暴露；新增 desktop-gate 后
+    // 第一次跑就撞上了。
+    #[cfg(windows)]
+    use super::taskbar_uses_light_theme;
+
     #[test]
     fn runtime_exit_with_no_code_keeps_tray() {
         assert!(should_keep_tray_alive(None));
