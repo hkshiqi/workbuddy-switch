@@ -24,7 +24,9 @@ import { DEMO_UNAVAILABLE_MESSAGE, demoModeEnabled, pagesDemoHostingEnabled } fr
 import { useSessionsNavEnabled } from "@/lib/nav-prefs";
 import { changeCompanionEnabled, useCompanionEnabled } from "@/lib/use-companion-enabled";
 import { useCreditAutoRefresh } from "@/lib/use-credit-auto-refresh";
+import { useCheckinRoundNotice } from "@/lib/use-checkin-round-notice";
 import { useRotateDeferredNotice } from "@/lib/use-rotate-deferred-notice";
+import { useTravelClaimNotice } from "@/lib/use-travel-claim-notice";
 import { useUpdateState } from "@/lib/use-update-state";
 import { useWorkbuddyStatusRefresh } from "@/lib/use-workbuddy-status-refresh";
 import { useAccountsStore } from "@/stores/accounts";
@@ -226,6 +228,9 @@ function Layout() {
   useCreditAutoRefresh();
   useWorkbuddyStatusRefresh();
   useRotateDeferredNotice();
+  // 后台轮次的结果出口：不挂这两个，自动签到 / 旅行就只在设置页的心跳里可见（P1-4）。
+  useCheckinRoundNotice();
+  useTravelClaimNotice();
 
   return (
     <div className="flex h-screen min-h-0 overflow-hidden bg-background">

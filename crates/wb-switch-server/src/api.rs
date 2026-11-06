@@ -1517,8 +1517,11 @@ async fn api_save_checkin_config(Json(body): Json<Value>) -> Response {
             let saved = config::load_checkin_config();
             let was_enabled = before.get("enabled").and_then(Value::as_bool) == Some(true);
             if !was_enabled && saved.get("enabled").and_then(Value::as_bool) == Some(true) {
+                // 走 `run_checkin_round`（与后台循环同一个入口）：这一轮在独立任务里
+                // 执行，panic 会落成心跳里的 `panic` 而不是把 spawn 出来的任务打死。
+                // webui 没有托盘与事件通道，结果只经心跳 / 日志可见。
                 tokio::spawn(async {
-                    let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery)
+                    let _ = checkin::run_checkin_round(checkin::CheckinCycleMode::PeriodicRecovery)
                         .await;
                 });
             }

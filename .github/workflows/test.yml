@@ -119,6 +119,65 @@ jobs:
       - name: Desktop app tests
         run: cargo test -p wb-switch-rust
 
+  # 兜底门禁：`lint` 绑定在 macos-14 上，拿不到该 runner 的环境里它会被直接取消
+  # （fork 常见），于是 fmt / clippy / server 测试 / src-tauri 测试一次都不执行——
+  # 而这些恰恰是改后端时唯一的编译验证，等于「改完 Rust 没人编译过」。
+  # 这里用 windows-latest 复刻同一组检查：不追求替代 lint（macOS 专属 cfg 分支仍由它
+  # 覆盖），只保证「改了 src-tauri 就一定有一台机器真的编译过」。
+  desktop-gate:
+    name: desktop gate (fmt + clippy + server/desktop tests, windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-desktop-gate-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-desktop-gate-
+            ${{ runner.os }}-cargo-test-
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # tsc 顺带产出 dist：clippy 检查 src-tauri 时 tauri-build 要求 frontendDist 存在。
+      - name: Type-check and build frontend
+        run: npm run build
+
+      # tauri-build 还要求 externalBin 存在。Windows 侧的 externalBin 带 .exe 后缀，
+      # 与 macOS 只需裸文件名不同；两个都建，避免因宿主差异漏建。
+      - name: Stub companion runtime binary
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          touch "src-tauri/binaries/agent-studio-runtime-$host"
+          touch "src-tauri/binaries/agent-studio-runtime-$host.exe"
+
+      - name: Check formatting
+        run: cargo fmt --check -p wb-switch-core -p wb-switch-server -p wb-switch-rust
+
+      - name: Clippy
+        run: cargo clippy -p wb-switch-core -p wb-switch-server -p wb-switch-rust --all-targets --no-deps -- -D warnings
+
+      - name: Server tests
+        run: cargo test -p wb-switch-server
+
+      - name: Desktop app tests
+        run: cargo test -p wb-switch-rust
+
   # 前端行为测试：纯逻辑单测（node 环境），不依赖 Rust 工具链。
   frontend-tests:
     name: frontend-tests
