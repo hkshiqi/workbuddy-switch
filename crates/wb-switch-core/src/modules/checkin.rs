@@ -33,7 +33,7 @@ use crate::modules::account::{
 };
 use crate::modules::config::{
     add_checkin_log, http_request, is_route_missing, load_checkin_config, load_checkin_logs,
-    now_ms, parse_clock, RunFlagGuard, CHECKIN_API_PREFIX,
+    now_ms, parse_clock, record_checkin_heartbeat, RunFlagGuard, CHECKIN_API_PREFIX,
 };
 use crate::modules::refresh::{ensure_fresh_token, refresh_account_token};
 use crate::modules::variant::WbVariant;
@@ -669,17 +669,37 @@ pub fn next_cycle_delay() -> Duration {
     delay
 }
 
-/// 窗口模式下到点复核发现服务端「今日已签」→ 补一条 `already` 回执。
+/// 是否需要补写 `already` 回执（纯决策，便于单测；不含任何文件 IO）。
+///
+/// - 窗口生效（`Some(win)`）：该窗口（最近一个已应到的目标时刻之后）还没有
+///   success/already 才补写，避免每轮重复；
+/// - 窗口未生效（`None`）：没有目标时刻可去重，总是补写一条。
+fn receipt_needed(win: Option<(u32, u32)>, now: i64, account: &Value, logs: &[Value]) -> bool {
+    let Some(win) = win else {
+        return true;
+    };
+    let Some(latest) = latest_target_ms(now, account, win) else {
+        // 目标时刻无法解析（极端时区 / DST 缺口）：保守不写，避免每轮重复刷日志。
+        return false;
+    };
+    !logs_answered_window(logs, account, latest)
+}
+
+/// 到点复核发现服务端「今日已签」→ 补一条 `already` 回执。
 ///
 /// 回执让「本窗口已回应」跨重启成立，避免次日 00:0x 被误判为「窗口未回应」而提前签。
-/// 只在该窗口尚无记录时补写（每账号每目标时刻至多一条），且仅窗口模式补写；
+/// 窗口生效时只在该窗口尚无记录时补写（每账号每目标时刻至多一条）；窗口未生效
+/// （`win = None`）时没有目标时刻可去重，直接补一条「今日已签」回执，让托盘与
+/// 「今日已签」判定也能看到这次结果（P2-1）。
+///
+/// 不会把日志刷爆：落盘侧 `config::normalize_checkin_logs` 对重复 `already` 按
+/// (账号, 本地日期) 去重保最新，并保留最多 `CHECKIN_LOG_MAX_RECORDS` 条 /
+/// `CHECKIN_LOG_KEEP_DAYS` 天，因此每轮补写只会刷新同日那一条。
+///
 /// `checkin_account` / `run_checkin_all` 的公开 payload 不变。
-fn write_window_receipt(win: (u32, u32), account: &Value) {
+fn write_window_receipt(win: Option<(u32, u32)>, account: &Value) {
     let now = now_ms();
-    let Some(latest) = latest_target_ms(now, account, win) else {
-        return;
-    };
-    if logs_answered_window(&load_checkin_logs(), account, latest) {
+    if !receipt_needed(win, now, account, &load_checkin_logs()) {
         return;
     }
     add_checkin_log(&json!({
@@ -699,16 +719,21 @@ fn write_window_receipt(win: (u32, u32), account: &Value) {
 /// 时间段生效时只处理「到点未办」的账号：未到点整轮不发任何请求，返回
 /// `{"status":"skipped","reason":"before_checkin_time","accounts":[]}`。
 /// 时间段未生效时，每轮处理全部允许自动签到的账号。
+///
+/// 每个早退路径与正常结束都会写一次心跳（`config::record_checkin_heartbeat`），
+/// 供设置页展示「上一轮」；唯一的例外是抢锁失败（另一轮正在跑，不是本轮的结果）。
 pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     let Some(_guard) = RunFlagGuard::try_acquire(&CHECKIN_RUNNING) else {
         return json!({"status": "skipped", "reason": "already_running"});
     };
     let cfg = load_checkin_config();
     if cfg.get("enabled").and_then(|v| v.as_bool()) != Some(true) {
+        record_checkin_heartbeat("disabled", false, false);
         return json!({"status": "disabled"});
     }
     let accounts = auto_checkin_accounts(load_accounts(), &cfg);
     if accounts.is_empty() {
+        record_checkin_heartbeat("no_accounts", false, false);
         return json!({"status": "no_accounts"});
     }
     let window = window_minutes(&cfg);
@@ -720,6 +745,7 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
     if accounts.is_empty() {
         // 只有时间段生效时才可能为空：整轮没有任何账号到点，不发任何请求。
         record_cycle_health(false);
+        record_checkin_heartbeat("before_checkin_time", false, false);
         return json!({"status": "skipped", "reason": "before_checkin_time", "accounts": []});
     }
     let mut summary = json!({"status": "ok", "accounts": []});
@@ -731,10 +757,9 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
             had_errors = true;
         }
         if outcome == Some("already") {
-            // 到点复核发现服务端已签（例如用户白天手动签过）→ 补一条窗口回执。
-            if let Some(win) = window {
-                write_window_receipt(win, &acc);
-            }
+            // 到点复核发现服务端已签（例如用户白天手动签过）→ 补一条回执。
+            // 窗口未生效时同样补写：否则托盘与「今日已签」判定永远看不到这次结果。
+            write_window_receipt(window, &acc);
         }
         let mut row = json!({
             "email": account_display_name(&acc),
@@ -748,7 +773,32 @@ pub async fn run_checkin_cycle(_mode: CheckinCycleMode) -> Value {
         summary["accounts"].as_array_mut().unwrap().push(row);
     }
     record_cycle_health(had_errors);
+    record_checkin_heartbeat("ok", had_errors, false);
     summary
+}
+
+/// 在独立任务里跑一轮自动签到，并把 panic 转成心跳失败后继续（绝不向上传播）。
+///
+/// 宿主侧的裸 `loop` 一旦在 `run_checkin_cycle(...).await` 里 panic，整条后台线程
+/// 就静默停摆（自动签到从此不再执行，且没有任何提示）。这里用 `tokio::spawn`
+/// 把这一轮隔离到独立任务：任务 panic 只会让 `JoinHandle` 返回 `JoinError`，
+/// 调用方据此记录一条失败心跳并继续下一轮。
+///
+/// 不引入新依赖（本仓库没有 `futures-util`）：poll 由 `JoinHandle` 承担，
+/// panic 判定用 `JoinError::is_panic()`。
+pub async fn run_checkin_round(mode: CheckinCycleMode) -> Value {
+    match tokio::spawn(run_checkin_cycle(mode)).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            let panicked = error.is_panic();
+            let status = if panicked { "panic" } else { "aborted" };
+            record_checkin_heartbeat(status, true, panicked);
+            json!({
+                "status": status,
+                "error": error.to_string(),
+            })
+        }
+    }
 }
 
 /// True when every stored account has a today's log of `success` or `already`.
@@ -789,9 +839,7 @@ pub fn accounts_checked_in_today(
         let Some(id) = account.get("id").and_then(Value::as_str) else {
             return false;
         };
-        latest_today_result(logs, id, today)
-            .map(|result| result == "success" || result == "already")
-            .unwrap_or(false)
+        today_answered(logs, id, today)
     })
 }
 
@@ -827,14 +875,20 @@ pub fn load_checkin_logs_with_variant() -> Vec<Value> {
     checkin_logs_with_variant(&load_checkin_logs(), &load_accounts())
 }
 
-fn latest_today_result<'a>(logs: &'a [Value], account_id: &str, today: &str) -> Option<&'a str> {
-    logs.iter()
-        .rev()
-        .find(|entry| {
-            entry.get("accountId").and_then(Value::as_str) == Some(account_id)
-                && date_str(entry.get("ts").and_then(Value::as_i64)) == today
-        })
-        .and_then(|entry| entry.get("result").and_then(Value::as_str))
+/// 当天该账号是否存在任意一条 `success` / `already` 日志。
+///
+/// 与 `logs_answered_window`（「窗口内任意一条即算回应」）同口径：**任意一条**即算
+/// 今日已签，而不是取「当天最后一条」。后者会让「早上 success、下午一次失败」把
+/// 托盘判定从「已签到」打回「一键签到」（P2-12）；`error` 只用于展示与重试预算。
+fn today_answered(logs: &[Value], account_id: &str, today: &str) -> bool {
+    logs.iter().any(|entry| {
+        entry.get("accountId").and_then(Value::as_str) == Some(account_id)
+            && date_str(entry.get("ts").and_then(Value::as_i64)) == today
+            && matches!(
+                entry.get("result").and_then(Value::as_str),
+                Some("success" | "already")
+            )
+    })
 }
 
 /// 对全部账号批量签到（前端「刷新并签到」/ 一键签到）。
@@ -1214,20 +1268,118 @@ mod tests {
         ));
     }
 
+    /// P2-12 口径统一：当天任意一条 success/already 即算已签，
+    /// 当天稍后的一次失败不再把托盘判定打回「未签到」（旧行为见 `CHECKIN-VERIFY.md`）。
     #[test]
-    fn checked_in_today_false_when_one_failed_last() {
+    fn checked_in_today_true_when_any_success_even_if_a_later_attempt_failed() {
         let accounts = vec![json!({"id": "a"})];
         let logs = vec![
             json!({"accountId": "a", "result": "success", "ts": 1_700_000_000_000_i64}),
             json!({"accountId": "a", "result": "error", "ts": 1_700_000_200_000_i64}),
         ];
         let today = date_str(Some(1_700_000_200_000));
-        assert!(!accounts_checked_in_today(
+        assert!(accounts_checked_in_today(
             &accounts,
             &logs,
             &today,
             &json!({})
         ));
+
+        // 顺序无关：先失败后成功同样算已签。
+        let reordered = vec![
+            json!({"accountId": "a", "result": "error", "ts": 1_700_000_000_000_i64}),
+            json!({"accountId": "a", "result": "already", "ts": 1_700_000_200_000_i64}),
+        ];
+        assert!(accounts_checked_in_today(
+            &accounts,
+            &reordered,
+            &today,
+            &json!({})
+        ));
+
+        // 只有失败 / 只有昨天的成功都不算今日已签。
+        let only_error = vec![json!({
+            "accountId": "a",
+            "result": "error",
+            "ts": 1_700_000_000_000_i64
+        })];
+        assert!(!accounts_checked_in_today(
+            &accounts,
+            &only_error,
+            &today,
+            &json!({})
+        ));
+        let yesterday = vec![json!({
+            "accountId": "a",
+            "result": "success",
+            "ts": 1_699_000_000_000_i64
+        })];
+        assert!(!accounts_checked_in_today(
+            &accounts,
+            &yesterday,
+            &today,
+            &json!({})
+        ));
+    }
+
+    /// 回执判定：窗口未生效时总是补写（P2-1）；窗口生效时只在窗口未回应时补写。
+    #[test]
+    fn receipt_needed_is_always_true_without_window_and_deduped_with_window() {
+        let (account, target) = due_fixture();
+        let now = target + 60_000;
+        let other_day_success = vec![log_row("due-a", "success", target - 600_000)];
+
+        // 窗口未生效：无论日志如何都补写（落盘侧按 (账号, 本地日期) 去重保最新）。
+        assert!(receipt_needed(None, now, &account, &[]));
+        assert!(receipt_needed(None, now, &account, &other_day_success));
+
+        // 窗口生效且本窗口尚无 success/already：补写。
+        assert!(receipt_needed(Some(TEST_WINDOW), now, &account, &[]));
+        assert!(receipt_needed(
+            Some(TEST_WINDOW),
+            now,
+            &account,
+            &other_day_success
+        ));
+        // 已回应（目标之后的 success/already）：不再重复补写。
+        assert!(!receipt_needed(
+            Some(TEST_WINDOW),
+            now,
+            &account,
+            &[log_row("due-a", "already", target + 60_000)]
+        ));
+        assert!(!receipt_needed(
+            Some(TEST_WINDOW),
+            now,
+            &account,
+            &[log_row("due-a", "success", target + 60_000)]
+        ));
+        // error 不算回应。
+        assert!(receipt_needed(
+            Some(TEST_WINDOW),
+            now,
+            &account,
+            &[log_row("due-a", "error", target + 60_000)]
+        ));
+        // 目标时刻无法解析（(start==end) 之外的极端窗口）：保守不写。
+        let unresolvable = (24 * 60, 24 * 60 + 1);
+        assert!(!receipt_needed(Some(unresolvable), now, &account, &[]));
+    }
+
+    /// panic 守护：`tokio::spawn` 让任务内 panic 只表现为 `JoinError`，
+    /// 调用方（`run_checkin_round`）据此写失败心跳并继续下一轮，循环不会退出。
+    #[tokio::test]
+    async fn spawned_round_panic_surfaces_as_join_error() {
+        // 与 `run_checkin_round` 内部同一条路径：spawn → await → is_panic()。
+        let handle = tokio::spawn(async move {
+            panic!("checkin round panic (test)");
+        });
+        let error = handle.await.expect_err("任务 panic 必须变成 JoinError");
+        assert!(error.is_panic(), "JoinError::is_panic 必须能识别 panic");
+
+        // 对照：正常任务不会返回错误，说明上面判定不是恒真。
+        let ok = tokio::spawn(async move { json!({"status": "ok"}) }).await;
+        assert!(ok.is_ok());
     }
 
     #[test]

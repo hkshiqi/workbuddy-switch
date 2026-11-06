@@ -1129,6 +1129,15 @@ pub fn get_checkin_logs() -> Value {
     json!({ "logs": checkin::load_checkin_logs_with_variant() })
 }
 
+/// GET /api/checkin/health —— 自动签到循环心跳（设置页「上一轮」展示用）。
+///
+/// 只读：文件缺失或损坏时 core 返回安全默认值（`ts: 0` / `last_status: "unknown"`），
+/// 因此这里不需要错误分支。
+#[tauri::command]
+pub fn get_checkin_health() -> Value {
+    crate::modules::config::load_checkin_health()
+}
+
 // ---------------------------------------------------------------------------
 // 派猫猫旅行
 // ---------------------------------------------------------------------------

@@ -56,6 +56,9 @@ pub(crate) fn notify_codebuddy_cli_updated(app: &tauri::AppHandle) {
 /// 后台循环：自动签到启动即核验，之后按 core 计算的下一轮延迟睡眠（未设置
 /// 签到时间段时固定 30 分钟）；自动轮换每 30 秒检查；每天一次保活；
 /// 限额 hook 信号每秒轮询一次（入账即通知前端）；限额 hook 启动时后台默认接入。
+///
+/// 签到走 `run_checkin_round`：它在独立任务里跑一轮，任务 panic 只会变成心跳里的
+/// `panic` 状态并继续下一轮，不会让这条 `loop` 静默停摆（见 core 的同名函数）。
 fn spawn_background_loops(app: tauri::AppHandle) {
     let rotate_app = app.clone();
     tauri::async_runtime::spawn(async move {
@@ -63,11 +66,11 @@ fn spawn_background_loops(app: tauri::AppHandle) {
             eprintln!("[签到] 历史日志整理失败: {error}");
         }
         let _ =
-            modules::checkin::run_checkin_cycle(modules::checkin::CheckinCycleMode::StartupVerify)
+            modules::checkin::run_checkin_round(modules::checkin::CheckinCycleMode::StartupVerify)
                 .await;
         loop {
             tokio::time::sleep(modules::checkin::next_cycle_delay()).await;
-            let _ = modules::checkin::run_checkin_cycle(
+            let _ = modules::checkin::run_checkin_round(
                 modules::checkin::CheckinCycleMode::PeriodicRecovery,
             )
             .await;
@@ -277,6 +280,7 @@ pub fn run() {
             commands::get_auto_checkin_config,
             commands::save_auto_checkin_config,
             commands::get_checkin_logs,
+            commands::get_checkin_health,
             commands::get_travel_status,
             commands::get_auto_travel_config,
             commands::save_auto_travel_config,

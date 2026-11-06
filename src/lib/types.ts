@@ -432,8 +432,18 @@ export interface SwitchResult {
   sessionRecovery?: SessionRecoveryReport;
 }
 
+/**
+ * `enabled` 的来源（后端读取期派生，**不落盘**）：
+ * - `user`：配置里有显式 `enabled`，即用户亲手设过；
+ * - `legacy_config`：配置文件存在但没有 `enabled` 字段（旧版本写的配置）；
+ * - `default`：其余（全新安装；仅有签到日志不再算已有安装）。
+ */
+export type CheckinEnabledSource = "user" | "legacy_config" | "default";
+
 export interface CheckinConfig {
   enabled: boolean;
+  /** `enabled` 的取值来源；用于在开关旁标注「自动启用」，避免静默翻转不可追溯。 */
+  enabled_source?: CheckinEnabledSource;
   /** 关闭自动签到的账号 id；状态展示和刷新附带签到也跳过，主动手动签到不受影响。 */
   excluded_account_ids?: string[];
   /** 签到时间段（"HH:MM"，本地时区）；空串 = 不限制。两端都合法且 start < end 才生效。 */
@@ -444,6 +454,22 @@ export interface CheckinConfig {
   end_hour?: number;
   keepalive_days: number;
   lazy_refresh_hours: number;
+}
+
+/** 自动签到循环的心跳（后台每轮结束都会更新）。 */
+export interface CheckinHealth {
+  /** 上一轮结束时间（ms）；0 = 从未执行过。 */
+  ts: number;
+  /** 上一轮的结果：ok / disabled / no_accounts / before_checkin_time / panic / aborted / unknown。 */
+  last_status: string;
+  /** 上一轮是否有账号失败（仅对 `ok` 有意义）。 */
+  had_errors: boolean;
+  /** 上一轮是否因 panic 被守护捕获。 */
+  panicked: boolean;
+  /** 连续 panic 轮数；正常轮次清零。 */
+  consecutive_panics: number;
+  /** 心跳文件是否存在（从未跑过为 false）。 */
+  file_exists?: boolean;
 }
 
 export interface CheckinLog {

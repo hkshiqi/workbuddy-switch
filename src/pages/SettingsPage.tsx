@@ -32,6 +32,10 @@ import { Switch } from "@/components/ui/switch";
 import { TimePicker } from "@/components/ui/time-picker";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
+import {
+  formatCheckinHeartbeat,
+  isCheckinHeartbeatStale,
+} from "@/lib/checkin-health";
 import { canPersistErrorLog } from "@/lib/error-report";
 import { setSessionsNavEnabled, useSessionsNavEnabled } from "@/lib/nav-prefs";
 import { setDefaultArchiveSyncEnabled, useDefaultArchiveSyncEnabled } from "@/lib/sync-prefs";
@@ -42,6 +46,7 @@ import type {
   AppNotification,
   AutoRotateConfig,
   CheckinConfig,
+  CheckinHealth,
   CheckinLog,
   GithubConfig,
   RateLimitConfig,
@@ -379,11 +384,14 @@ function AutoCheckinCard() {
   const logsOpen = openSections.includes("logs");
   const [logs, setLogs] = useState<CheckinLog[] | null>(null);
   const [logsError, setLogsError] = useState("");
+  /** 后台循环心跳：只用于展示「上一轮」，读取失败不影响配置编辑。 */
+  const [health, setHealth] = useState<CheckinHealth | null>(null);
   const [saving, setSaving] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     void loadConfig();
+    void loadHealth();
   }, []);
 
   // 账号列表来自全局 store：为空时补拉一次（只取状态与账号，不拉积分）。
@@ -408,6 +416,20 @@ function AutoCheckinCard() {
       adoptSaved(loaded);
     } catch (e) {
       toast.error("自动签到配置加载失败", { description: api.asError(e) });
+    }
+  }
+
+  /**
+   * 读取后台循环心跳（「上一轮」展示）。
+   *
+   * 静默失败：心跳只是可观测性，读不到就不显示这一行，不能因此弹 toast
+   * 或影响配置编辑。
+   */
+  async function loadHealth() {
+    try {
+      setHealth(await api.getCheckinHealth());
+    } catch {
+      setHealth(null);
     }
   }
 
@@ -567,6 +589,7 @@ function AutoCheckinCard() {
       else if (allSkippedOrUnavailable) toast.info(text);
       else toast.success(text);
       void loadConfig();
+      void loadHealth();
       if (logsOpen) void loadLogs();
     } catch (e) {
       toast.error("签到失败", { description: api.asError(e) });
@@ -609,6 +632,9 @@ function AutoCheckinCard() {
   const checkinAccounts = accounts.filter((account) => variantSupportsCheckin(accountVariant(account)));
   const excludedIds = new Set(cfg?.excluded_account_ids ?? []);
   const windowIssue = cfg ? checkinWindowIssue(cfg.checkin_start, cfg.checkin_end) : null;
+  /** 渲染时刻：心跳相对时间与「超时未更新」都按它计算（每次重渲染刷新）。 */
+  const now = Date.now();
+  const healthStale = health !== null && isCheckinHeartbeatStale(health, now);
 
   return (
     <SettingsGroup
@@ -622,7 +648,29 @@ function AutoCheckinCard() {
               <AccordionSettingsRow
                 value="params"
                 label="启用自动签到"
-                description="为允许自动签到的账号核验状态并补签；可在下方按账号关闭"
+                description={
+                  <>
+                    为允许自动签到的账号核验状态并补签；可在下方按账号关闭
+                    {/* P1-1 可追溯性：开关是「默认回落」而非用户亲手打开时明确标注，
+                        避免日志落盘导致的静默翻转无从解释。 */}
+                    {cfg.enabled && cfg.enabled_source !== "user" && (
+                      <span className="mt-0.5 block text-amber-600">
+                        当前为自动启用：检测到历史签到记录或旧版配置，非你手动开启
+                      </span>
+                    )}
+                    {health && (
+                      <span
+                        className={cn(
+                          "mt-0.5 block",
+                          healthStale ? "text-amber-600" : undefined,
+                        )}
+                      >
+                        {formatCheckinHeartbeat(health, now)}
+                        {healthStale && "（超过 2 小时未更新，请确认 App 仍在运行）"}
+                      </span>
+                    )}
+                  </>
+                }
                 actions={
                   <>
                     <DemoAction>

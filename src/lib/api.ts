@@ -11,6 +11,7 @@ import type {
   CodeBuddyCnIdeStatus,
   CodeBuddyCnIdeSwitchResult,
   CheckinConfig,
+  CheckinHealth,
   CheckinLog,
   CheckinResult,
   CreditExpiry,
@@ -65,7 +66,7 @@ const DEMO_READ_COMMANDS = new Set([
   "get_status", "get_accounts", "get_codebuddy_cli_status", "get_codebuddy_cn_ide_status", "get_codebuddy_ide_status", "get_vscode_ext_status", "get_jetbrains_status", "list_vscode_sessions", "list_codebuddy_ide_sessions", "list_codebuddy_intl_ide_sessions", "vscode_session_links_preview", "codebuddy_ide_session_links_preview", "codebuddy_intl_ide_session_links_preview", "list_account_sessions", "session_links_preview_cross", "list_session_groups", "get_session_group", "preview_session_group_pair", "get_checkin_status",
   "get_credit_expiry", "get_credit_statistics", "get_auto_checkin_config",
   "get_token_statistics",
-  "get_checkin_logs", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
+  "get_checkin_logs", "get_checkin_health", "get_auto_rotate_config", "rotate_status", "get_rotate_logs",
   "get_github_config", "check_update", "get_launch_at_login_enabled", "switch_progress",
   "get_travel_status", "get_auto_travel_config", "get_rate_limits",
   "get_rate_limit_hook_status", "get_rate_limit_config",
@@ -176,6 +177,7 @@ const ROUTES: Record<string, Route> = {
   get_auto_checkin_config: { method: "GET", path: "/api/checkin/config" },
   save_auto_checkin_config: { method: "POST", path: "/api/checkin/config" },
   get_checkin_logs: { method: "GET", path: "/api/checkin/logs" },
+  get_checkin_health: { method: "GET", path: "/api/checkin/health" },
   list_notifications: { method: "GET", path: "/api/notifications" },
   record_notification: { method: "POST", path: "/api/notifications/record" },
   clear_notifications: { method: "POST", path: "/api/notifications/clear" },
@@ -913,6 +915,16 @@ export function saveAutoCheckinConfig(config: CheckinConfig): Promise<CheckinCon
 
 export function getCheckinLogs(): Promise<{ logs: CheckinLog[] }> {
   return call("get_checkin_logs");
+}
+
+/**
+ * 自动签到循环心跳：后台每轮结束（含各早退路径）都会更新。
+ *
+ * 只读，文件缺失时后端返回安全默认值（`ts: 0` / `last_status: "unknown"`），
+ * 因此调用方不需要额外兜底，直接把结果用于「上一轮」展示即可。
+ */
+export function getCheckinHealth(): Promise<CheckinHealth> {
+  return call("get_checkin_health");
 }
 
 export async function getTravelStatus(accountId: string): Promise<TravelStatus> {
