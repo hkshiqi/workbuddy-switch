@@ -1121,16 +1121,21 @@ pub fn get_auto_checkin_config() -> Value {
 /// `enabled` 由关转开时立即跑一轮（与自动旅行的保存语义一致）：否则用户打开开关后
 /// 最长要等一个完整周期（30 分钟）才会发生第一次签到，期间关掉 App 就等于什么都没发生。
 /// 只在 false→true 触发——修改时间段 / 排除名单也走本入口，不能每次保存都发一轮请求。
+///
+/// 这一轮也要投递结果：用户刚打开开关就盯着页面，这时「签上了没有」是他最想知道的事，
+/// 而它走的是后台通道（托盘刷新 + 事件 + 系统通知），不投递就又是一次静默执行。
 #[tauri::command]
-pub fn save_auto_checkin_config(config: Value) -> Result<Value, String> {
+pub fn save_auto_checkin_config(app: tauri::AppHandle, config: Value) -> Result<Value, String> {
     let before = crate::modules::config::load_checkin_config();
     crate::modules::config::save_checkin_config(&config).map_err(|e| e.to_string())?;
     let saved = crate::modules::config::load_checkin_config();
     let was_enabled = before.get("enabled").and_then(Value::as_bool) == Some(true);
     if !was_enabled && saved.get("enabled").and_then(Value::as_bool) == Some(true) {
-        // 抢不到 RunFlagGuard 时 run_checkin_cycle 自行返回 already_running，无需额外防重入。
-        tauri::async_runtime::spawn(async {
-            let _ = checkin::run_checkin_cycle(checkin::CheckinCycleMode::PeriodicRecovery).await;
+        // 抢不到 RunFlagGuard 时 run_checkin_round 自行返回 already_running，无需额外防重入。
+        tauri::async_runtime::spawn(async move {
+            let summary =
+                checkin::run_checkin_round(checkin::CheckinCycleMode::PeriodicRecovery).await;
+            crate::deliver_checkin_notify(&app, &summary, false);
         });
     }
     Ok(saved)

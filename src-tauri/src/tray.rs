@@ -865,48 +865,191 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// 一轮签到的结果分布。
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+struct CheckinTally {
+    success: usize,
+    already: usize,
+    error: usize,
+    inactive: usize,
+}
+
+impl CheckinTally {
+    fn total(self) -> usize {
+        self.success + self.already + self.error + self.inactive
+    }
+}
+
+fn checkin_tally(value: &Value) -> CheckinTally {
+    let mut tally = CheckinTally::default();
+    let Some(accounts) = value.get("accounts").and_then(Value::as_array) else {
+        return tally;
+    };
+    for account in accounts {
+        match account.get("result").and_then(Value::as_str) {
+            Some("success") => tally.success += 1,
+            Some("already") => tally.already += 1,
+            Some("error") => tally.error += 1,
+            Some("inactive") => tally.inactive += 1,
+            _ => {}
+        }
+    }
+    tally
+}
+
+fn format_tally(tally: CheckinTally) -> String {
+    let mut text = format!(
+        "签到完成：成功 {}，已签 {}，失败 {}",
+        tally.success, tally.already, tally.error
+    );
+    // 国际版无签到活动：单列「未开放」，避免被误读成失败或漏报。
+    if tally.inactive > 0 {
+        text.push_str(&format!("，未开放 {}", tally.inactive));
+    }
+    text
+}
+
 fn format_checkin_tooltip(value: &Value) -> String {
     if value.get("status").and_then(Value::as_str) == Some("skipped")
         && value.get("reason").and_then(Value::as_str) == Some("already_running")
     {
         return "签到任务正在进行，请稍后再试".to_string();
     }
-    let Some(accounts) = value.get("accounts").and_then(Value::as_array) else {
-        return "没有可签到的账号".to_string();
-    };
-    if accounts.is_empty() {
+    let tally = checkin_tally(value);
+    if tally.total() == 0 {
         return "没有可签到的账号".to_string();
     }
+    format_tally(tally)
+}
 
-    let mut ok = 0;
-    let mut already = 0;
-    let mut err = 0;
-    let mut inactive = 0;
-    for account in accounts {
-        match account.get("result").and_then(Value::as_str) {
-            Some("success") => ok += 1,
-            Some("already") => already += 1,
-            Some("error") => err += 1,
-            Some("inactive") => inactive += 1,
-            _ => {}
-        }
+/// 整轮失败状态：`run_checkin_round` 把 panic / 取消翻成这两种 `status`。
+fn is_failed_status(value: &Value) -> bool {
+    matches!(
+        value.get("status").and_then(Value::as_str),
+        Some("panic" | "aborted")
+    )
+}
+
+/// 本轮是否「失败」：有账号 `error`，或整轮 panic / 被取消。
+///
+/// 后台循环据此判断「是不是刚开始出错」——持续失败只提示一次，否则每 30 分钟
+/// 弹一次同样的失败，比不提示更糟。
+pub(crate) fn checkin_round_failed(value: &Value) -> bool {
+    is_failed_status(value) || checkin_tally(value).error > 0
+}
+
+/// 后台轮次该不该打扰用户；`Some(level)` 即系统通知与前端 toast 的等级。
+///
+/// 稳态（当天已签 → 全是 `already`、未到点、未启用）返回 `None`。
+/// `announce_errors` 由调用方按「上一轮是否也在出错」传入。
+fn checkin_notify_level(value: &Value, announce_errors: bool) -> Option<&'static str> {
+    let tally = checkin_tally(value);
+    if tally.success > 0 {
+        return Some("success");
     }
-    let mut text = format!("签到完成：成功 {ok}，已签 {already}，失败 {err}");
-    // 国际版无签到活动：单列「未开放」，避免被误读成失败或漏报。
-    if inactive > 0 {
-        text.push_str(&format!("，未开放 {inactive}"));
+    if announce_errors && (tally.error > 0 || is_failed_status(value)) {
+        return Some("error");
     }
-    text
+    None
+}
+
+/// 后台轮次要展示的文案（空串 = 没有可汇报的结果）。
+fn checkin_round_message(value: &Value) -> String {
+    if is_failed_status(value) {
+        let reason = value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("未知错误");
+        return format!("签到执行异常，已跳过本轮：{reason}");
+    }
+    let tally = checkin_tally(value);
+    if tally.total() == 0 {
+        return String::new();
+    }
+    format_tally(tally)
+}
+
+/// 后台自动签到一轮结束后的投递：托盘菜单、应用内事件、系统通知。
+///
+/// 此前后台轮次没有任何出口——用户只能进设置页看心跳（P1-4）。这里补三条：
+///  1. 真有账号刚被签上时重建托盘菜单，让「一键签到 / 已签到」立刻反映当天状态；
+///     只在可能翻转时重建，因为无谓的 `set_menu` 会让用户正打开的菜单闪掉；
+///  2. 每轮都推 `checkin-round-finished`，页面据此刷新标记，不必等重新挂载；
+///  3. 值得打扰时（见 `checkin_notify_level`）投递系统通知。
+///
+/// 窗口没开时只有系统通知可见，窗口开着时以应用内 toast 为准（系统通知在开发态
+/// 会被登记到「终端」名下，且投递失败不可观测）。
+pub(crate) fn announce_checkin_round<R: Runtime>(
+    app: &AppHandle<R>,
+    result: &Value,
+    announce_errors: bool,
+) {
+    if crate::is_screenshot_demo() {
+        return;
+    }
+    let tally = checkin_tally(result);
+    if tally.success > 0 {
+        refresh_tray_menu(app);
+    }
+    let message = checkin_round_message(result);
+    let level = checkin_notify_level(result, announce_errors);
+    let _ = app.emit(
+        "checkin-round-finished",
+        serde_json::json!({
+            "message": message,
+            "level": level,
+            "signed": tally.success,
+            "already": tally.already,
+            "failed": tally.error,
+            "status": result.get("status").cloned().unwrap_or(Value::Null),
+        }),
+    );
+    if level.is_some() && !message.is_empty() {
+        notify_checkin(app, &message);
+    }
+}
+
+/// 旅行领取一轮结束后的投递：只有真领到东西才提示。
+///
+/// 派发轮（`run_travel_cycle`）刻意不发提示：它是当天的例行簿记，每天一份「已派出」
+/// 只会稀释真正有用的提示；派发失败仍可在旅行卡片上看到。
+pub(crate) fn announce_travel_claim<R: Runtime>(app: &AppHandle<R>, result: &Value) {
+    if crate::is_screenshot_demo() {
+        return;
+    }
+    let claimed = result.get("claimed").and_then(Value::as_u64).unwrap_or(0);
+    if claimed == 0 {
+        return;
+    }
+    let total = result
+        .get("total")
+        .and_then(Value::as_u64)
+        .unwrap_or(claimed);
+    let message = format!("已领取 {claimed}/{total} 份旅行奖励");
+    let _ = app.emit(
+        "travel-claim-finished",
+        serde_json::json!({ "message": message, "claimed": claimed, "total": total }),
+    );
+    notify_checkin(app, &message);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
-        should_keep_tray_alive, should_wake_main_window, tray_icon, tray_icon_variant, MouseButton,
-        MouseButtonState, TrayIconVariant,
+        checkin_notify_level, checkin_round_failed, checkin_round_message, format_checkin_tooltip,
+        is_silent_startup, should_activate_on_second_launch, should_keep_tray_alive,
+        should_wake_main_window, tray_icon, tray_icon_variant, MouseButton, MouseButtonState,
+        TrayIconVariant,
     };
     use serde_json::json;
+
+    // Windows 专属用例（`taskbar_theme_is_readable_on_windows`）要用的函数。
+    // 必须用 cfg 门住：该函数本身是 `#[cfg(windows)]`，无条件导入会让 macOS 上
+    // 报「未使用」。缺这行时那条用例在 Windows 上根本编译不过——`wb-switch-rust`
+    // 此前没有任何 job 在 Windows 上编译过，所以一直没暴露；新增 desktop-gate 后
+    // 第一次跑就撞上了。
+    #[cfg(windows)]
+    use super::taskbar_uses_light_theme;
 
     #[test]
     fn runtime_exit_with_no_code_keeps_tray() {
@@ -1156,6 +1299,71 @@ mod tests {
         assert_eq!(
             format_checkin_tooltip(&payload),
             "签到完成：成功 1，已签 0，失败 0，未开放 1"
+        );
+    }
+
+    /// 后台轮次的通知门槛：只有「刚签上」才必提示。
+    #[test]
+    fn background_round_notifies_only_when_something_happened() {
+        let mixed = json!({
+            "status": "ok",
+            "accounts": [
+                {"result": "success"},
+                {"result": "already"},
+                {"result": "error"}
+            ]
+        });
+        assert_eq!(checkin_notify_level(&mixed, true), Some("success"));
+
+        // 稳态：当天已签过，后续每 30 分钟都是 already → 不能每轮弹一次。
+        let steady = json!({"status": "ok", "accounts": [{"result": "already"}]});
+        assert_eq!(checkin_notify_level(&steady, true), None);
+
+        // 未启用 / 没账号 / 未到点：没有任何账号行，同样不打扰。
+        assert_eq!(
+            checkin_notify_level(&json!({"status": "disabled"}), true),
+            None
+        );
+        assert_eq!(
+            checkin_notify_level(
+                &json!({"status": "skipped", "reason": "before_checkin_time", "accounts": []}),
+                true
+            ),
+            None
+        );
+    }
+
+    /// 持续失败只提示一次；恢复后再次失败要重新提示（`announce_errors` 由调用方算）。
+    #[test]
+    fn background_round_dedupes_persistent_failures() {
+        let failing = json!({"status": "ok", "accounts": [{"result": "error"}]});
+        assert_eq!(checkin_notify_level(&failing, true), Some("error"));
+        assert_eq!(checkin_notify_level(&failing, false), None);
+        assert!(checkin_round_failed(&failing));
+        assert!(!checkin_round_failed(
+            &json!({"status": "ok", "accounts": [{"result": "already"}]})
+        ));
+    }
+
+    /// panic / aborted 没有任何账号行，但必须被当成失败提示（否则守护吞掉了异常却没人知道）。
+    #[test]
+    fn panic_round_counts_as_failure_and_is_explained() {
+        let panicked = json!({"status": "panic", "panicked": true, "error": "task panicked"});
+        assert!(checkin_round_failed(&panicked));
+        assert_eq!(checkin_notify_level(&panicked, true), Some("error"));
+        assert_eq!(
+            checkin_round_message(&panicked),
+            "签到执行异常，已跳过本轮：task panicked"
+        );
+    }
+
+    /// 没有可汇报结果的轮次返回空串：调用方据此不发通知，避免出现误导性文案。
+    #[test]
+    fn background_round_message_is_empty_without_results() {
+        assert_eq!(checkin_round_message(&json!({"status": "disabled"})), "");
+        assert_eq!(
+            checkin_round_message(&json!({"status": "ok", "accounts": [{"result": "already"}]})),
+            "签到完成：成功 0，已签 1，失败 0"
         );
     }
 

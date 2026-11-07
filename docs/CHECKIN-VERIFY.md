@@ -8,6 +8,7 @@
 > - R2（QA 二次复核）：P1-1「后果 2」改为**当场翻转**（`SettingsPage.tsx:569` 的 `loadConfig()`，非"下次挂载"）；P1-2 增加"不要把「全部立即签到」当缓解手段"的警告；新增 P2-12（当天最后一次失败把托盘判定打回未签）；§5.2/§5.3 **收窄 CI 覆盖范围**为"仅 core @ ubuntu+windows，宿主 crate 无 CI 测试证据"。
 > - **R3（修复落地，与本文档同批提交）**：本报告 §3 中 **P1-1、P1-2、P1-5、P2-1、P2-6、P2-12 已修**，逐条状态见各小节首行的「**状态**」。行为变更（默认值判据收窄）单独写在 [`CHECKIN-BEHAVIOR-CHANGE.md`](./CHECKIN-BEHAVIOR-CHANGE.md)，升级影响与重新开启方式在那里。**R2 中"不要把「全部立即签到」写进引导"的警告已随 P1-1 的根因修复失效**（写日志不再影响 `enabled`），已在 P1-2 与 §4 中移除。
 > - 仍未修：**P1-3**（App 常驻未联动提示）、**P1-4**（后台结果不可见，仅补了心跳可观测性）。**P1-2** 与 **P2-1 的"手动/批量 `already` 不写回执"那一半**已在同一轮补齐（P1-2 = 保存配置 false→true 时 spawn 一轮，两端均改；P2-1 = `checkin_account` 的 already 分支补回执）。
+> - **R4（P1-3 + P1-4 落地）**：上一条里的两个遗留项已修，逐条状态见各小节首行。后台轮次现在有结果出口（托盘刷新 + `checkin-round-finished` 事件 + 系统通知，均带通知门槛），启动设置里对「关了开机自启却开着后台功能」给出常驻提示。同时补了 CI 兜底门禁 `desktop-gate`——`lint` 绑在 `macos-14` 上，拿不到该 runner 的环境（含本 fork）会被直接取消，导致 fmt / clippy / `wb-switch-server` / `wb-switch-rust` 测试**一次都不执行**，§5 的覆盖范围由此收窄过。
 
 ---
 
@@ -18,6 +19,7 @@
 3. [缺口 / 风险清单](#3-缺口--风险清单)
 4. [结论与最值得补的 3 个方向](#4-结论与最值得补的-3-个方向)
 5. [编译与单测验证](#5-编译与单测验证)
+6. [手工验收清单（CI 覆盖不到的部分）](#6-手工验收清单ci-覆盖不到的部分)
 
 ---
 
@@ -145,22 +147,32 @@
   ① ✅ **【已落地】来源可追溯**：API 同时返回 `enabled` 的来源（`enabled_source`：显式保存 / 旧配置回落 / 全新默认），设置页在开关旁标注「当前为自动启用：**检测到旧版或损坏的配置文件**，非你手动开启」——把"不可追溯"消掉，且不动调度语义。（注：文案不能说"检测到历史签到记录"，判据里已经没有日志了。）
   ② ✅ **【已落地，根因修复】** 使用痕迹判据从 `config || logs` 收窄为「仅配置文件存在」，与 ① 同批下发；升级影响通过 [`CHECKIN-BEHAVIOR-CHANGE.md`](./CHECKIN-BEHAVIOR-CHANGE.md) 说明（等价于 release note）。
   ③ 未采用（② 已让本条失去必要性）：让手动签到写独立日志文件。
-  ④ 未做（归入 P1-4）：每轮把生效的 `enabled` 与结果暴露一次；目前退化为「心跳文件 + 设置页展示」这一层可观测性，见 P2-6 的修复。
+  ④ 已做（R4，见 P1-4）：每轮把结果推出去（托盘刷新 + `checkin-round-finished` 事件 + 系统通知，带通知门槛），不再只剩「心跳文件 + 设置页展示」这一层。
 
 **P1-2 开启后不立即执行 → 用户"开了却没反应"**
 > **状态：✅ 已修（R3）。** `save_auto_checkin_config`（Tauri `commands.rs`）与 `POST /api/checkin/config`（HTTP `api.rs`）现在会在 `enabled` **由 false 变 true** 时 `spawn` 一轮 `run_checkin_cycle(CheckinCycleMode::PeriodicRecovery)`——与自动旅行的保存语义一致。只在 false→true 触发：修改签到时间段 / 排除名单走同一保存入口，不会白跑请求。并发由 `RunFlagGuard` 兜底（抢不到锁返回 `already_running`），无需额外防重入。README「使用」第 8 条已写明"开启后立即执行一轮"。**R2 的 ⚠️ 警告已失效**——P1-1 根因修复后写日志不再翻转 `enabled`。
 - 修复前：保存配置只落盘、不触发任何一轮签到，用户最长等 30 分钟（`next_cycle_delay` 的 clamp 上限），期间关掉 App 则什么都不发生。
-- 残余（归 P1-3/P1-4）：开启那一轮的结果仍只在设置页「上一轮」可见，不弹通知、不刷托盘。
+- 残余（R4 已修）：开启那一轮的结果现在会走后台投递通道（托盘刷新 + toast + 系统通知），不再只停留在设置页「上一轮」。
 
 **P1-3 「每天自动」的前置条件（App 常驻 / 开机自启）既未提示也未联动**
+> **状态：已修（R4）。** 启动设置卡片（`SettingsPage.tsx` 的 `StartupCard`）现在会读自动签到 / 自动旅行配置：开关处于关闭态且其中任一开着时，行下方常驻一行琥珀色提示「只有你当天手动打开过 App 才会执行」；关掉开关的瞬间 toast 也从「已关闭」换成带后果说明的警告。判定与文案都在前端，后端不变——它无法知道用户"想不想常驻"。
 - 自动签到依赖宿主进程常驻：`lib.rs:59-75`（桌面）/ `main.rs:25-35`（CLI）。开机自启是**另一个独立卡片**、系统级 opt-in（`SettingsPage.tsx:1477+`、`commands.rs:1321-1333`），二者没有任何交叉提示。
 - 时间段说明里只有一句"需 App 在窗口附近运行才能按时执行"（`SettingsPage.tsx:650`），未覆盖"未设置时间段时也要 App 在跑"和"建议开启开机自启"。
 - 影响：用户设好就关掉 App，第二天发现没签，归因为"功能不存在 / 坏了"。
+- 残余：webui 形态下没有「开机自启」这个概念（`launch-at-login` 仅桌面端注册），该提示只在桌面端出现——这是对的，不是遗漏。
 
 **P1-4 后台自动签到结果对用户完全不可见（无通知、无托盘刷新）**
+> **状态：已修（R4）。** `run_checkin_round` 的返回值不再被丢弃：
+> - 托盘：`tray::announce_checkin_round` 在「真有账号刚被签上」时重建菜单——只在可能翻转时重建，因为无谓 `set_menu` 会让用户正打开的菜单闪掉；标签随即变成「已签到」。
+> - 应用内：每轮推 `checkin-round-finished`（`message` / `level` / `signed` / `already` / `failed`），窗口开着时由 `useCheckinRoundNotice` 弹 toast。
+> - 系统通知：窗口没开时唯一可见的通道，与上一条并存（开发态通知会登记到「终端」名下，且投递失败不可观测，所以两者都发、以应用内为准）。
+> - 通知门槛 `checkin_notify_level`：只有「刚签上」与「刚开始出错」才提示。稳态轮次（当天已签 → 全 `already`、未到点、未启用）一律不弹，否则每 30 分钟一条立刻变骚扰；持续失败只提示一次（`deliver_checkin_notify` 跨轮传 `previous_had_errors`），恢复后再次失败会重新提示；`panic` / `aborted` 没有账号行但按失败提示——守护把异常吞掉了，再没人提就等于静默。
+> - 保存配置触发的那一轮也投递（`save_auto_checkin_config` 收 `AppHandle`）：用户刚打开开关就盯着页面，「签上了没有」正是他最想知道的。
+> - 旅行只提示「领取」（`claimed > 0`）：派发轮是当天例行簿记，每天一条「已派出」只会稀释真正有用的消息。
 - 两宿主的周期循环都丢弃返回值：`let _ = run_checkin_cycle(...)`（`lib.rs:65-74`、`main.rs:30-33`），不弹通知、不写 `notifications`（`notifications::record` 只被前端 toast 和 API 调用，`commands.rs:1450-1455`、`api.rs:1677-1689`；core 的 checkin/travel 都没有调用点）。
 - 托盘菜单标签"已签到/一键签到"只在 `build_tray_menu` 时计算（`tray.rs:619-638`），且只在轻量模式切换、`CheckinBusyGuard` 起止时重建（`tray.rs:318-366`、`377-386`）——后台自动签到完成**不会**刷新托盘，标签会长期停留在"一键签到"。
 - 唯一可观测物是设置页的签到日志（懒加载、需手动展开，`SettingsPage.tsx:394-402`、`757-803`）。
+- 残余（R4 后）：账号卡上的「今日已签」徽标仍不会随后台签到自动变色——`checkinMap` 只在账号集合 / 配置变化时查一次（`AccountsPage.tsx:406-421`）。事件通道已经就位，接上它只是再调一次 `checkinMap`，本轮没做（需要确认是否会与卡片本地计数冲突）。
 
 **P1-5 README 完全没有签到 / 旅行**
 > **状态：已修（R3）。** README「功能」表已补「每日自动签到（含派猫猫旅行）」一行，「使用」步骤已补一条路径（设置 → 自动签到 → 开启，并写明需 App 常驻、建议同时开启开机自启）。
@@ -201,7 +213,7 @@
 - `RunFlagGuard`/`AccountRunGuard` 是 `Drop` 复位，unwind 路径也能释放，所以**不会**造成标志位永久卡真。
 
 **P2-7 账号页签到状态不轮询**
-- `checkinMap` 只在账号集合/配置变化时查一次（`AccountsPage.tsx:406-421`），页面长开时"今日已签到"徽标会过期；后台签到完成后也不会有事件推送刷新（对应 P1-4）。
+- `checkinMap` 只在账号集合/配置变化时查一次（`AccountsPage.tsx:406-421`），页面长开时"今日已签到"徽标会过期；后台签到完成后也不会自动刷新——（R4 后）事件通道 `checkin-round-finished` 已经就位，接上它只是再调一次 `checkinMap`，本轮未做（需确认是否与卡片本地计数冲突）。
 
 **P2-8 排除名单只作用于签到，不作用于自动旅行**
 - `travel.rs` 只读自己的 `auto_travel_config`，不读 `excluded_account_ids`（`travel.rs:845-861`）。
@@ -231,7 +243,7 @@
 ### 结论
 **该功能已经完整可用，不需要"新增"实现。** 端到端链路（UI / 托盘 / 后台定时器 → API/IPC → core → `codebuddy.cn` 两个签到接口 → `~/.wb-switch/auto_checkin_logs.json`）全部闭环；国际版零请求短路、信封凭据短路、`[start,end)` 窗口与错峰抽签、排除名单、并发保护、日志 30 天/500 条治理都实现到位且有单测（编译与单测结果见 §5：**`wb-switch-core` 在 CI 的 ubuntu/windows 上 773/759 全绿**；宿主 crate 无 CI 测试证据，见 §5.3 的限定）。桌面版**确实**会每天自动签到（`src-tauri/src/lib.rs:59-75` + `205-207`），与 webui 走同一套 core 循环。
 
-功能"看起来不存在"的原因是产品与文档层面：默认关闭且默认值不持久（P1-1，**【R3 已修】**：判据收窄 + 来源标注）、开启后不立即执行（P1-2，**【R3 已修】**：保存配置 false→true 时立即跑一轮）、后台执行无任何可见反馈（P1-4，**只补了心跳**）、README 一个字都没提（P1-5，**【R3 已修】**）。
+功能"看起来不存在"的原因是产品与文档层面：默认关闭且默认值不持久（P1-1，**【R3 已修】**：判据收窄 + 来源标注）、开启后不立即执行（P1-2，**【R3 已修】**：保存配置 false→true 时立即跑一轮）、后台执行无任何可见反馈（P1-4，**【R4 已修】**：托盘刷新 + 事件 toast + 系统通知）、README 一个字都没提（P1-5，**【R3 已修】**）。
 
 风险总账：**P0 = 0**，**P1 = 5**（全部是产品/文档/默认值语义层，无实现正确性缺陷；R3 修掉 P1-1 与 P1-5），**P2 = 12**（体验与残余风险；R3 修掉 P2-6 与 P2-12，部分解决 P2-1）。
 > R3 修复批次的行为变更（默认值判据收窄）单独成文：[`CHECKIN-BEHAVIOR-CHANGE.md`](./CHECKIN-BEHAVIOR-CHANGE.md)。
@@ -274,29 +286,35 @@
 
 编译器与测试通过仓库已有的 GitHub Actions 工作流 `.github/workflows/test.yml` 完成。
 
-运行记录：<https://github.com/hkshiqi/workbuddy-switch/actions/runs/42282041386>
+运行记录：<https://github.com/hkshiqi/workbuddy-switch/actions/runs/42315373466>（R4）
 
-> ⚠️ **下表是 R3 之前（`22b318c`）的结果快照。** R3 之后 `wb-switch-core` 的用例数会上升（新增 panic 守护 / 心跳 / 日志上限 / 回执去重等用例，同时删掉被反转的旧用例），后台宿主 `lib.rs` / `main.rs` 也改了调用点，因此**本表不能代表 R3 之后的 CI 结论**——需以 R3 提交触发的新一轮 `rust-tests` 为准。本机仍无法编译 Rust（见 §5.1）。
+> 下表是 **R4 的实测结果**（全链路：core + server + `src-tauri` + 前端）。R4 新增了 `desktop-gate` job，第一次让 `wb-switch-rust`（`src-tauri`）在 Windows 上被真正编译与测试——此前它连编译证据都没有。本机仍无法编译 Rust（见 §5.1）。
 
 | Job | 平台 | 跑什么 | 结果 |
 | --- | --- | --- | --- |
-| `rust-tests` | ubuntu-latest | `cargo test -p wb-switch-core` + `clippy -p core -p server`（linux cfg，`test.yml:53`、`57-61`） | ✅ **773 passed / 0 failed**（job 整体成功 ⇒ server 在 Linux 上**编译通过**） |
-| `rust-tests` | windows-latest | `cargo test -p wb-switch-core`（`test.yml:53`） | ✅ **759 passed / 0 failed** + 另 5 passed |
-| `rust-tests` | macos-14 | `cargo test -p wb-switch-core`（`test.yml:53`） | ⚠️ **cancelled** —— `The configuration 'macos-14-arm64-us-default' is not supported`（fork 账号无该 runner 配置，**与代码无关**） |
-| `lint` | macos-14 | `cargo fmt --check` + `clippy`(core/server/rust) + `cargo test -p wb-switch-server`（`test.yml:115`）+ `cargo test -p wb-switch-rust`（`test.yml:120`） | ⚠️ **cancelled** |
-| `frontend-tests` | ubuntu-latest | `npm test`（`test.yml:128`） | ✅ success |
+| `rust-tests` | ubuntu-latest | `cargo test -p wb-switch-core` + `clippy -p core -p server`（linux cfg） | ✅ **779 passed / 0 failed** |
+| `rust-tests` | windows-latest | `cargo test -p wb-switch-core` | ✅ **765 passed / 0 failed** + 另 5 passed |
+| `rust-tests` | macos-14 | `cargo test -p wb-switch-core` | ⚠️ **cancelled** —— `The configuration 'macos-14-arm64-us-default' is not supported`（fork 账号无该 runner 配置，**与代码无关**） |
+| **`desktop-gate`（R4 新增）** | **windows-latest** | `cargo fmt --check` + `cargo test -p wb-switch-server` + `cargo test -p wb-switch-rust` | ✅ **server 9 passed / desktop 38 passed，0 failed** |
+| `lint` | macos-14 | `tsc` + `fmt` + `clippy`(core/server/rust) + server/desktop 测试 | ⚠️ **cancelled**（同上，runner 不可用） |
+| `frontend-tests` | ubuntu-latest | `npm test` | ✅ **74 passed** |
 
-两点必须说清的覆盖边界（由 QA 复核 CI 结构后指出，本次已核实）：
+R4 的 `desktop-gate` 当场抓到一个**既有 bug**，可作「这个门禁为什么必须补」的直接证据：`tray.rs` 的 Windows 专属用例 `taskbar_theme_is_readable_on_windows` 调用了 `taskbar_uses_light_theme()`，但测试模块的 `use super::{...}` 里没有它——该函数是 `#[cfg(windows)]`，无条件导入会在 macOS 上报未使用，于是当初就没加。结果这条用例**在 Windows 上根本编译不过**，而 `wb-switch-rust` 此前没有任何 job 在 Windows 上编译过，问题一直没暴露。修法是给导入加 `#[cfg(windows)]`，R4 一并提交。
 
-1. **`wb-switch-server` 与 `wb-switch-rust` 的单元测试从未在本轮 CI 跑过** —— 它们只出现在 `lint` job（`test.yml:115`、`120`），而该 job 因 macos runner 缺失被 cancelled。**而 `lib.rs` / `tray.rs` / `commands.rs` 这些"签到循环宿主"全在 `wb-switch-rust` 里**，所以本次 CI 结果**不能**用于支撑"桌面端宿主代码已被测试验证"。
-2. **macOS 平台的 core 结果同样是 cancelled（不是"该平台无测试"）**；773 ≠ 759 属平台 `cfg` 分支差异（`test.yml:22` 明确矩阵含 macos-14），属正常现象。
+覆盖边界（R3 时由 QA 指出，R4 已补掉前两条）：
+
+1. ~~`wb-switch-server` 与 `wb-switch-rust` 的单元测试从未在 CI 跑过~~ → **R4 已解决**：`desktop-gate` 在 windows-latest 上实跑 `cargo test -p wb-switch-server`（9 passed）与 `cargo test -p wb-switch-rust`（38 passed）。`lib.rs` / `tray.rs` / `commands.rs` 这些"签到循环宿主"现在有编译 + 测试执行证据。
+2. **macOS 仍无 Rust 证据**：`rust-tests` 的 macos-14 与 `lint` 都因 runner 配置缺失被 cancelled。macOS 专属 `cfg` 分支（托盘图标绘制、`LaunchAgent` 自启）仍只靠静态走查。779 ≠ 765 属平台 `cfg` 分支差异，正常现象。
+3. **Windows 侧的 clippy 未设门禁**：`desktop-gate` 关闭了 `RUSTFLAGS=-D warnings`（理由同 `build.yml`：vendor 快照的既有告警会被升成错误），也没跑 clippy——Windows 专属 `cfg` 分支的历史告警（core 的 `auth_file` / `codebuddy_cli` / `vscode_cn_inject`）仍然存在，只是不再阻断。`cargo fmt --check` 正常执行。
 
 ### 5.3 结论（含覆盖范围限定）
 
-- **`wb-switch-core` crate 编译通过**（Linux + Windows 双平台实际编译并运行），**单测 773 / 759 个全绿、0 失败（R3 之前的快照，R3 之后需以新一轮 CI 为准）**。macOS 与 `lint` 的 cancelled 是 fork runner 配置缺失，不构成代码质量结论。
-- **限定 1 —— 只覆盖 core**：`wb-switch-core` 是本次唯一有"编译 + 测试执行"双证据的 crate。
-- **限定 2 —— 宿主 crate 无测试证据**：`wb-switch-server`（8 个测试，`test.yml:115`）与 `wb-switch-rust`（40 个测试，`test.yml:120`，即 `src-tauri`）只在被 cancelled 的 `lint` job 里跑；其中 `wb-switch-server` 另有 ubuntu 侧 `clippy --all-targets` 的**编译**证据（`test.yml:57-61`，job 成功即通过），但**无测试执行证据**；`wb-switch-rust` 连编译证据都没有。
-- **限定 3 —— 桌面宿主（`lib.rs` / `tray.rs` / `commands.rs`）的正确性结论依赖静态走查**，不由 CI 背书。本次走查对宿主侧的判断（后台循环确实启动、托盘刷新时机、命令注册、`let _ =` 丢弃返回值等）均基于源码阅读 + 行号引用，未经过运行验证。
+- **`wb-switch-core` 编译通过并跑通单测**：Linux 779 / Windows 765（+5），0 失败。
+- **`wb-switch-server` 编译通过并跑通单测**：Windows 9 passed（`desktop-gate`）；另有 ubuntu 侧 `clippy --all-targets` 的编译证据。
+- **`wb-switch-rust`（`src-tauri`，含本次改动的 `lib.rs` / `tray.rs` / `commands.rs`）编译通过并跑通单测**：Windows 38 passed，其中包含 R4 新增的 4 条（`background_round_notifies_only_when_something_happened`、`background_round_dedupes_persistent_failures`、`panic_round_counts_as_failure_and_is_explained`、`background_round_message_is_empty_without_results`）。**这是本仓库第一次有机器编译并测试过桌面宿主。**
+- **前端**：`tsc` 通过、`vitest` 74 passed。
+- **限定 1 —— macOS 仍无证据**：macOS 专属 `cfg` 分支（托盘图标绘制、`LaunchAgent`）仍只靠静态走查。
+- **限定 2 —— 真实运行未验证**：以上都是"编译 + 单测"。托盘菜单重建、系统通知投递、toast 实际弹出这三件事都依赖真实窗口环境，CI 无法覆盖，需要在真机上点一遍（§6 给了手工验收清单）。
 - 签到相关单测**覆盖完整并通过**，本报告 §2 中依赖单测佐证的每条结论都有对应用例（**行号是 R3 之前的快照**；R3 改动过的文件行号已漂移，以用例名为准）：
   - 错峰抽签稳定性与跨账号/跨日分散：`checkin.rs:1377-1403`
   - 窗口合法性（半填 / 非法 / `start>=end` / 越界）：`checkin.rs:1406-1437`
@@ -316,4 +334,21 @@
   - panic 守护把 panic 翻成失败结果：`guarded_round_converts_panic_into_failure_outcome`（断言 `status == "panic"` / `panicked` / `reason` 含 "panic"，并有正常任务返回 Ok 的对照）
   - 回执去重（窗口内按窗口、`window=None` 按当天）：`receipt_needed_dedupes_per_window_and_per_day`
   - **R3 已反转**："当天最后一条失败即判未签"不再是预期，改为 `checked_in_today_true_when_any_success_even_if_a_later_attempt_failed`（早上 success + 下午 error → 仍判已签，对应 P2-12 的修复）
-- 因此准确表述是：**"签到逻辑集中在 core 且 core 有 773/759 个单测保护，编译与测试均已在 ubuntu/windows 实测通过"**；而不是"整个功能已被 CI 全绿背书"。本报告 §3 的 P1/P2 项均为产品、文档、默认值语义与可观测性问题，**不是** core 的实现正确性缺陷。
+- 因此准确表述是：**"签到逻辑集中在 core 且 core 有 779/765 个单测保护，编译与测试均已在 ubuntu/windows 实测通过；桌面宿主（`src-tauri`）自 R4 起也有编译 + 单测证据"**；而不是"整个功能已被 CI 全绿背书"（macOS 分支与真实弹窗仍未覆盖，见下）。本报告 §3 的 P1/P2 项均为产品、文档、默认值语义与可观测性问题，**不是** core 的实现正确性缺陷。
+
+---
+
+## 6. 手工验收清单（CI 覆盖不到的部分）
+
+P1-3 / P1-4 改的是「运行时能看到什么」，编译与单测只能证明代码成立，不能证明用户真能看见。以下 5 条需要在真机上点一遍：
+
+| # | 操作 | 期望 |
+| --- | --- | --- |
+| 1 | 关掉自动签到 → 打开它 | 立即出现「自动签到已开启」，随后（同一次保存触发的后台轮次）再出现一条「自动签到完成：成功 N…」；若账号当天已签，则只有第一条，不弹第二条 |
+| 2 | 保持自动签到开启，等到下一个周期（或临时把时间段设到当前分钟后一分钟） | 窗口开着时弹出「自动签到完成」toast；**托盘标签从「一键签到」变成「已签到」**（不需要重新打开菜单） |
+| 3 | 把某个账号的 Cookie 改坏，等一轮 | 第一次失败弹「自动签到失败」；**之后每轮不再重复弹**（持续失败只提示一次）；修复后再次失败会重新弹 |
+| 4 | 设置页 → 启动设置 → 关闭「开机时静默启动到托盘」（此时自动签到是开的） | toast 变成警告文案「自动签到只在 App 运行时执行…」；开关下方常驻一行琥珀色提示；重新打开自启后提示消失 |
+| 5 | 托盘菜单保持展开、同时后台签到恰好完成 | 菜单**不应**因为重建而闪掉（只在「真有账号刚被签上」时才重建；全 `already` 的稳态轮次不动菜单） |
+
+> 第 5 条是这次改动里唯一有争议的取舍：托盘标签要刷新就必须调 `set_menu`，而菜单展开时 `set_menu` 会让它关闭。折中方案是「只在今日已签状态可能翻转时重建」——一天最多几次，且几乎不会正好撞上用户开着菜单。若实测发现仍会闪，退路是把标签改成 tooltip 文案（tooltip 可随时更新，无闪烁）。
+

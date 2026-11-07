@@ -1558,6 +1558,14 @@ function UpdateCard() {
 function StartupCard() {
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
+  /**
+   * 依赖「App 在运行」的后台功能名（自动签到 / 自动旅行）。
+   *
+   * P1-3：这两项都由后端循环驱动，进程不在就什么都不会发生；而开机自启正是让进程
+   * 在用户没打开窗口的日子里也活着的手段。用户关掉自启时不会自己把两件事联系起来，
+   * 所以必须在这里说清。读取失败保持空数组：宁可不提示，也不凭空断言配置有问题。
+   */
+  const [appResidentFeatures, setAppResidentFeatures] = useState<string[]>([]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1574,6 +1582,22 @@ function StartupCard() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.allSettled([api.getAutoCheckinConfig(), api.getAutoTravelConfig()]).then(
+      ([checkin, travel]) => {
+        if (cancelled) return;
+        const names: string[] = [];
+        if (checkin.status === "fulfilled" && checkin.value.enabled) names.push("自动签到");
+        if (travel.status === "fulfilled" && travel.value.enabled) names.push("自动旅行");
+        setAppResidentFeatures(names);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   async function onToggle(value: boolean) {
     if (busy || enabled === null) return;
     const previous = enabled;
@@ -1582,7 +1606,16 @@ function StartupCard() {
       // 后端回读 OS 权威状态；即使与请求一致，也以回读值显示。
       const authoritative = await api.setLaunchAtLoginEnabled(value);
       setEnabled(authoritative);
-      toast.success(authoritative ? "已开启开机自启" : "已关闭开机自启");
+      if (!authoritative && appResidentFeatures.length > 0) {
+        // 关掉自启不是错误，但会让后台功能只在「那天开过 App」时生效。这条比一句
+        // 「已关闭」有用得多，所以占用同一处反馈，而不是再叠一条 toast。
+        toast.warning("已关闭开机自启", {
+          description: `${appResidentFeatures.join("、")}只在 App 运行时执行，未打开 App 的日子不会运行`,
+          duration: 10_000,
+        });
+      } else {
+        toast.success(authoritative ? "已开启开机自启" : "已关闭开机自启");
+      }
     } catch (e) {
       // 失败时恢复到最后一次确认的状态，并显示可读错误。
       setEnabled(previous);
@@ -1601,7 +1634,18 @@ function StartupCard() {
         <SettingsFieldRow
           className="border-b-0"
           label="开机时静默启动到托盘"
-          description="开关直接反映系统登录项状态；之后可从托盘「打开主界面」恢复"
+          description={
+            <>
+              开关直接反映系统登录项状态；之后可从托盘「打开主界面」恢复
+              {/* 用户主动关掉自启、又开着后台功能时才提示：开着自启时这句话是噪音。 */}
+              {enabled === false && appResidentFeatures.length > 0 && (
+                <span className="mt-0.5 block text-amber-600">
+                  已开启{appResidentFeatures.join("、")}，但 App 不随系统启动：只有你当天手动打开过
+                  App 才会执行
+                </span>
+              )}
+            </>
+          }
           htmlFor="startup-silent"
           operational
         >

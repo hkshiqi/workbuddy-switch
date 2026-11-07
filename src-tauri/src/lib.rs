@@ -37,6 +37,42 @@ pub(crate) fn deliver_rotate_notify(app: &tauri::AppHandle, result: &serde_json:
     }
 }
 
+/// 后台签到一轮的投递，返回「本轮是否在出错」。
+///
+/// 返回值是给下一轮用的：`announce_errors` 要「刚开始出错」才为真，否则持续失败
+/// 会每轮弹一次同样的通知。桌面端刷新托盘菜单、推 `checkin-round-finished` 并按需
+/// 投递系统通知（见 `tray::announce_checkin_round`）；其它形态没有事件通道，只需
+/// 返回值（webui 的循环在 server 侧，前端靠轮询）。
+pub(crate) fn deliver_checkin_notify(
+    app: &tauri::AppHandle,
+    result: &serde_json::Value,
+    previous_had_errors: bool,
+) -> bool {
+    #[cfg(desktop)]
+    {
+        let failed = tray::checkin_round_failed(result);
+        tray::announce_checkin_round(app, result, failed && !previous_had_errors);
+        failed
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, result, previous_had_errors);
+        false
+    }
+}
+
+/// 旅行领取一轮的投递：只有真领到奖励才提示（见 `tray::announce_travel_claim`）。
+pub(crate) fn deliver_travel_claim(app: &tauri::AppHandle, result: &serde_json::Value) {
+    #[cfg(desktop)]
+    {
+        tray::announce_travel_claim(app, result);
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = (app, result);
+    }
+}
+
 /// 广播「CodeBuddy CLI 认证状态可能已变」，让前端立即重读。
 ///
 /// 保活刷新会先批量改写账号库里的 token、再异步同步回 `settings.json`；这个窗口里
@@ -61,19 +97,25 @@ pub(crate) fn notify_codebuddy_cli_updated(app: &tauri::AppHandle) {
 /// `panic` 状态并继续下一轮，不会让这条 `loop` 静默停摆（见 core 的同名函数）。
 fn spawn_background_loops(app: tauri::AppHandle) {
     let rotate_app = app.clone();
+    let checkin_app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(error) = modules::config::compact_checkin_logs() {
             eprintln!("[签到] 历史日志整理失败: {error}");
         }
-        let _ =
+        // 每轮结果都要自己走出去：此前后台轮次没有任何出口，用户只能进设置页看心跳
+        // 才知道今天到底签没签上（P1-4）。`had_errors` 跨轮保留，让「持续失败」只
+        // 提示一次，恢复后再次失败会重新提示。
+        let summary =
             modules::checkin::run_checkin_round(modules::checkin::CheckinCycleMode::StartupVerify)
                 .await;
+        let mut had_errors = deliver_checkin_notify(&checkin_app, &summary, false);
         loop {
             tokio::time::sleep(modules::checkin::next_cycle_delay()).await;
-            let _ = modules::checkin::run_checkin_round(
+            let summary = modules::checkin::run_checkin_round(
                 modules::checkin::CheckinCycleMode::PeriodicRecovery,
             )
             .await;
+            had_errors = deliver_checkin_notify(&checkin_app, &summary, had_errors);
         }
     });
 
@@ -88,11 +130,14 @@ fn spawn_background_loops(app: tauri::AppHandle) {
     });
 
     // 旅行领取：启动立刻查一轮（避免重启后空等 15 分钟漏领），之后按周期检查。
+    let travel_claim_app = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = modules::travel::run_travel_claim_cycle().await;
+        let result = modules::travel::run_travel_claim_cycle().await;
+        deliver_travel_claim(&travel_claim_app, &result);
         loop {
             tokio::time::sleep(modules::travel::TRAVEL_CLAIM_INTERVAL).await;
-            let _ = modules::travel::run_travel_claim_cycle().await;
+            let result = modules::travel::run_travel_claim_cycle().await;
+            deliver_travel_claim(&travel_claim_app, &result);
         }
     });
 
